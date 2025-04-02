@@ -21,7 +21,6 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -51,7 +50,7 @@ class LlamaMLP(nn.Module):
 
         # --- Table Injection Parameters ---
         self.apply_table_injection = False # Global flag (set during setup)
-        self.table_token = None         # Will hold the precomputed table embedding (set per-input)
+        self.table_embedding = None         # Will hold the precomputed table embedding (set per-input)
         self.retracing_ratio = 0        # Injection strength (set during setup)
         self.entropy_threshold = 1.0    # Trigger threshold (set during setup)
         self.starting_layer = 0         # Layer range start (set during setup)
@@ -108,14 +107,14 @@ class LlamaMLP(nn.Module):
 
         return down_proj
 
-    def initialize_adapter_weights(self, table_embedding):
+    def initialize_adapter_weights(self):
         """Initializes adapter weights based on the table embedding."""
-        if table_embedding is None:
+        if self.table_embedding is None:
             self.adpt_w1 = None
             self.adpt_w2 = None
             return
 
-        table_embedding = table_embedding.to(self.gate_proj.weight.device)
+        table_embedding = self.table_embedding.to(self.gate_proj.weight.device)
 
         scale_factor1 = (torch.mean(torch.abs(self.up_proj.weight))) / (torch.mean(torch.abs(table_embedding)).clamp(min=1e-6))
         scale_factor2 = (torch.mean(torch.abs(self.down_proj.weight))) / (torch.mean(torch.abs(table_embedding)).clamp(min=1e-6))
@@ -389,13 +388,14 @@ def generate(
      if table_content and tokenizer:
         logger.info("Processing table_content for injection...")
         table_embedding = self._process_table_to_embedding(table_content, tokenizer, self.device)
-        if table_embedding is not None:
-            model_kwargs["table_embedding"] = table_embedding
-            logger.info(f"Added table_embedding (shape: {table_embedding.shape}) to model_kwargs.")
-        else:
-            logger.warning("Failed to process table_content into embedding. Injection skipped for this call.")
+        base_model = self.get_encoder() if self.config.is_encoder_decoder else self
+        base_model.layers[0].mlp.table_token = table_embedding
+        model_kwargs["table_embedding"] = table_embedding
+
+        logger.info(f"Added table_embedding (shape: {table_embedding.shape}) to model_kwargs.")
     elif table_content and not tokenizer:
         logger.warning("`table_content` was provided, but tokenizer is not available on the model instance. Cannot process table.")
+    
 
 
     # ====================================================================
@@ -784,6 +784,7 @@ def apply_table_llama(
     ):
     transformers.models.llama.modeling_llama.LlamaMLP = LlamaMLP
     transformers.models.llama.modeling_llama.LlamaModel.forward = table_forward
+    transformers.models.llama.modeling_llama.LlamaForCausalLM.generate = generate
 
     self.model.lm_head = self.lm_head
     self.model.layers[0].mlp.apply_memvr = True
