@@ -287,7 +287,7 @@ def table_forward(
 
     next_cache = None
     if use_cache:
-        next_cache = (
+        next_cache =(
             next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
         )
     if not return_dict:
