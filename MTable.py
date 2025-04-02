@@ -50,7 +50,7 @@ class LlamaMLP(nn.Module):
 
         # --- Table Injection Parameters ---
         self.apply_table_injection = False # Global flag (set during setup)
-        self.table_embedding = None         # Will hold the precomputed table embedding (set per-input)
+        self.table_token = None         # Will hold the precomputed table embedding (set per-input)
         self.retracing_ratio = 0        # Injection strength (set during setup)
         self.entropy_threshold = 1.0    # Trigger threshold (set during setup)
         self.starting_layer = 0         # Layer range start (set during setup)
@@ -107,9 +107,9 @@ class LlamaMLP(nn.Module):
 
         return down_proj
 
-    def initialize_adapter_weights(self):
+    def initialize_adapter_weights(self,table_embedding):
         """Initializes adapter weights based on the table embedding."""
-        if self.table_embedding is None:
+        if table_embedding is None:
             self.adpt_w1 = None
             self.adpt_w2 = None
             return
@@ -139,6 +139,7 @@ def table_forward(
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
@@ -160,7 +161,6 @@ def table_forward(
     # --- Retrieve Embedding ---
     if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-   
     # --- Handle Cache and Position IDs --- (Keep standard logic)
     past_seen_tokens = 0
     if use_cache:  # kept for BC (cache positions)
@@ -184,6 +184,7 @@ def table_forward(
     # embed positions
     hidden_states = inputs_embeds
 
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
     # --- Decoder Layers ---
     all_hidden_states = () if output_hidden_states else None
     all_self_attns = () if output_attentions else None
@@ -192,9 +193,9 @@ def table_forward(
     # --- Table Injection Setup ---
     # Get global settings from the first layer's MLP
 
-    table_embedding = kwargs.get("table_embedding", None)
-    if apply_injection and table_embedding is not None:
-        self.layers[0].mlp.table_token = table_embedding.to(hidden_states.device)
+    # table_embedding = kwargs.get("table_embedding", None)
+    # if apply_injection and table_embedding is not None:
+    #     self.layers[0].mlp.table_token = table_embedding.to(hidden_states.device)
 
     first_mlp = self.layers[0].mlp
     apply_injection = getattr(first_mlp, "apply_table_injection", False)  # Check if injection is enabled
@@ -202,7 +203,7 @@ def table_forward(
     starting_layer = getattr(first_mlp, 'starting_layer', 0)
     ending_layer = getattr(first_mlp, 'ending_layer', len(self.layers))
     retracing_ratio = getattr(first_mlp, 'retracing_ratio', 0.0) # Need this for initialization scale
-
+    table_token = getattr(first_mlp, 'table_token', None)
     table_retracing_event = False # Flag to ensure trigger happens only once per forward pass
 
 
@@ -220,6 +221,7 @@ def table_forward(
                     output_attentions,
                     use_cache,
                     cache_position,
+                    position_embeddings,
             )
         else:
             layer_outputs = decoder_layer(
@@ -230,6 +232,8 @@ def table_forward(
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **flash_attn_kwargs,
             )
 
         hidden_states = layer_outputs[0]
@@ -243,10 +247,9 @@ def table_forward(
         # --- Entropy Calculation and Trigger Logic ---
         if apply_injection and not table_retracing_event and layer_idx >= starting_layer and layer_idx <=ending_layer : # Check if within range AND not the very last layer
             norm_hidden_states = self.norm(hidden_states)
-            logits = lm_head(norm_hidden_states)
+            logits = self.lm_head(norm_hidden_states)
             last_token_logits = logits[:, -1, :]
             last_token_logits = last_token_logits.float() # Ensure float32 for stable softmax/log
-
             # Calculate entropy (using top-k approximation like LLaVA for efficiency)
             k_topk = 10  
             top_k_scores, _ = torch.topk(last_token_logits, k_topk)
@@ -260,10 +263,9 @@ def table_forward(
             if avg_entropy > entropy_threshold:
                 table_retracing_event = True 
                 next_layer_mlp = self.layers[layer_idx + 1].mlp
-
-                current_table_token = self.layers[0].mlp.table_token # Retrieve shared token
-
-                next_layer_mlp.initialize_adapter_weights(current_table_token)
+                table_embedding = self.embed_tokens(table_token) 
+                # Set the table embedding for the next layer's MLP
+                next_layer_mlp.initialize_adapter_weights(table_embedding)
                 next_layer_mlp.adapt_signal = 1
                 next_layer_mlp.retracing_ratio = retracing_ratio
         
@@ -272,27 +274,19 @@ def table_forward(
             decoder_layer.mlp.adpt_w1 = None
             decoder_layer.mlp.adpt_w2 = None
 
-
-
     hidden_states = self.norm(hidden_states)
 
-        # add hidden states from the last decoder layer
+    # add hidden states from the last decoder layer
     if output_hidden_states:
         all_hidden_states += (hidden_states,)
 
-    next_cache = None
-    if use_cache:
-        next_cache =(
-            next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
-        )
-    if not return_dict:
-        return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-    return BaseModelOutputWithPast(
+    output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
     )
+    return output if return_dict else output.to_tuple()
 
 
 
@@ -383,18 +377,9 @@ def generate(
         )
 
        
-    table_embedding = None
-    tokenizer = getattr(self, "tokenizer", None) # Get tokenizer if available
-     if table_content and tokenizer:
+    if table_content :
         logger.info("Processing table_content for injection...")
-        table_embedding = self._process_table_to_embedding(table_content, tokenizer, self.device)
-        base_model = self.get_encoder() if self.config.is_encoder_decoder else self
-        base_model.layers[0].mlp.table_token = table_embedding
-        model_kwargs["table_embedding"] = table_embedding
-
-        logger.info(f"Added table_embedding (shape: {table_embedding.shape}) to model_kwargs.")
-    elif table_content and not tokenizer:
-        logger.warning("`table_content` was provided, but tokenizer is not available on the model instance. Cannot process table.")
+        self.model.layers[0].mlp.table_token = table_content# Set table token for first layer
     
 
 
