@@ -1,5 +1,6 @@
 import numpy as np
 import math
+from collections.abc import Callable
 import warnings
 from typing import List, Optional, Tuple, Union
 import safetensors
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import inspect
 
 import transformers
 
@@ -20,18 +22,45 @@ from transformers.modeling_outputs import (
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
 )
-from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
-    logging,
-    replace_return_docstrings,
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+
+from transformers.integrations.fsdp import is_fsdp_managed_module
+
+from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
+from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
+
+from transformers.generation.stopping_criteria import (
+    StoppingCriteriaList,
 )
+
+
+from transformers.generation.configuration_utils import (
+    NEED_SETUP_CACHE_CLASSES_MAPPING,
+    QUANT_BACKEND_CLASSES_MAPPING,
+    GenerationConfig,
+    GenerationMode,
+)
+from transformers.generation.stopping_criteria import (
+    StoppingCriteriaList,
+)
+
+
 from transformers.generation.logits_process import LogitsProcessorList
 
+import torch.distributed as dist
+
+
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import (
+    logging,
+)
+
+
+
+# 创建一个logger对象
+logger = logging.get_logger(__name__)
+# 设置日志级别
+logger.setLevel(logging.WARNING)
 
 
 class LlamaMLP(nn.Module):
@@ -51,7 +80,7 @@ class LlamaMLP(nn.Module):
 
         # --- Table Injection Parameters ---
         self.apply_table_injection = False # Global flag (set during setup)
-        self.table_token = None         # Will hold the precomputed table embedding (set per-input)
+        self.table_content = None         # Will hold the precomputed table embedding (set per-input)
         self.retracing_ratio = 0        # Injection strength (set during setup)
         self.entropy_threshold = 1.0    # Trigger threshold (set during setup)
         self.starting_layer = 0         # Layer range start (set during setup)
@@ -82,7 +111,6 @@ class LlamaMLP(nn.Module):
             down_proj = sum(down_proj)
         elif self.adapt_signal == 0:
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        
         elif self.adapt_signal == 1:
             # --- Table Injection Path ---
             # Ensure adapter weights are ready (should have been set by trigger logic)
@@ -108,7 +136,7 @@ class LlamaMLP(nn.Module):
 
         return down_proj
 
-    def initialize_adapter_weights(self, table_embedding):
+    def initialize_adapter_weights(self,table_embedding):
         """Initializes adapter weights based on the table embedding."""
         if table_embedding is None:
             self.adpt_w1 = None
@@ -140,6 +168,7 @@ def table_forward(
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **flash_attn_kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
@@ -163,27 +192,24 @@ def table_forward(
             inputs_embeds = self.embed_tokens(input_ids)
    
     # --- Handle Cache and Position IDs --- (Keep standard logic)
-    past_seen_tokens = 0
-    if use_cache:  # kept for BC (cache positions)
-        if not isinstance(past_key_values, StaticCache):
-            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_seen_tokens = past_key_values.get_seq_length()
+    if use_cache and past_key_values is None:
+        past_key_values = DynamicCache()
 
     if cache_position is None:
-        if isinstance(past_key_values, StaticCache):
-            raise ValueError("cache_position is a required argument when using StaticCache.")
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
         )
+
 
     if position_ids is None:
         position_ids = cache_position.unsqueeze(0)
 
     # --- Attention Mask --- (Keep standard logic)
-    causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)
-
+    causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
     # embed positions
     hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
     # --- Decoder Layers ---
     all_hidden_states = () if output_hidden_states else None
@@ -193,24 +219,20 @@ def table_forward(
     # --- Table Injection Setup ---
     # Get global settings from the first layer's MLP
 
-    table_embedding = kwargs.get("table_embedding", None)
-    if apply_injection and table_embedding is not None:
-        self.layers[0].mlp.table_token = table_embedding.to(hidden_states.device)
 
     first_mlp = self.layers[0].mlp
-    apply_injection = getattr(first_mlp, "apply_table_injection", False)  # Check if injection is enabled
+    apply_table_injection =self.layers[0].mlp.apply_table_injection  # Check if injection is enabled
+
     entropy_threshold = getattr(first_mlp, 'entropy_threshold', 1.0)
     starting_layer = getattr(first_mlp, 'starting_layer', 0)
     ending_layer = getattr(first_mlp, 'ending_layer', len(self.layers))
     retracing_ratio = getattr(first_mlp, 'retracing_ratio', 0.0) # Need this for initialization scale
-
+    table_token   = getattr(first_mlp, 'table_content', 0.0)
     table_retracing_event = False # Flag to ensure trigger happens only once per forward pass
 
-
-    for layer_idx, decoder_layer in enumerate(self.layers):
+    for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
         if self.gradient_checkpointing and self.training:
             layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -221,6 +243,7 @@ def table_forward(
                     output_attentions,
                     use_cache,
                     cache_position,
+                    position_embeddings,
             )
         else:
             layer_outputs = decoder_layer(
@@ -231,20 +254,18 @@ def table_forward(
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **flash_attn_kwargs,
             )
 
         hidden_states = layer_outputs[0]
 
-        if use_cache:
-            next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
         if output_attentions:
             all_self_attns += (layer_outputs[1],)
-
         # --- Entropy Calculation and Trigger Logic ---
-        if apply_injection and not table_retracing_event and layer_idx >= starting_layer and layer_idx <=ending_layer : # Check if within range AND not the very last layer
+        if apply_table_injection and not table_retracing_event and layer_idx >= starting_layer and layer_idx <=ending_layer : # Check if within range AND not the very last layer
             norm_hidden_states = self.norm(hidden_states)
-            logits = lm_head(norm_hidden_states)
+            logits = self.lm_head(norm_hidden_states)
             last_token_logits = logits[:, -1, :]
             last_token_logits = last_token_logits.float() # Ensure float32 for stable softmax/log
 
@@ -257,17 +278,19 @@ def table_forward(
             entropy = -torch.sum(probabilities * torch.log(probabilities.clamp(min=epsilon_log)), dim=-1)
             entropy = entropy / np.log(k_topk)
             avg_entropy = torch.mean(entropy).item()
-            
+            print(avg_entropy)
             if avg_entropy > entropy_threshold:
                 table_retracing_event = True 
                 next_layer_mlp = self.layers[layer_idx + 1].mlp
 
-                current_table_token = self.layers[0].mlp.table_token # Retrieve shared token
+                current_table_token = self.layers[0].mlp.table_content   # Retrieve shared token
+                print(current_table_token)
+                table_embeds = self.embed_tokens(current_table_token)
+                next_layer_mlp.initialize_adapter_weights(table_embeds)
 
-                next_layer_mlp.initialize_adapter_weights(current_table_token)
                 next_layer_mlp.adapt_signal = 1
                 next_layer_mlp.retracing_ratio = retracing_ratio
-        
+                print(f'add table content to {layer_idx+1}')
         if decoder_layer.mlp.adapt_signal == 1:
             decoder_layer.mlp.adapt_signal = 0
             decoder_layer.mlp.adpt_w1 = None
@@ -277,77 +300,73 @@ def table_forward(
 
     hidden_states = self.norm(hidden_states)
 
-        # add hidden states from the last decoder layer
+    # add hidden states from the last decoder layer
     if output_hidden_states:
         all_hidden_states += (hidden_states,)
 
-    next_cache = None
-    if use_cache:
-        next_cache =(
-            next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
-        )
-    if not return_dict:
-        return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-    return BaseModelOutputWithPast(
+    output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
     )
+    return output if return_dict else output.to_tuple()
 
 
 
 @torch.no_grad()
 def generate(
-        self,
-        inputs: Optional[torch.Tensor] = None,
-        generation_config: Optional[GenerationConfig] = None,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
-        synced_gpus: Optional[bool] = None,
-        assistant_model: Optional["PreTrainedModel"] = None,
-        streamer: Optional["BaseStreamer"] = None,
-        negative_prompt_ids: Optional[torch.Tensor] = None,
-        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-        *, # Force subsequent args to be keyword args
-        table_content: Optional[str] = None, # <--- OUR NEW ARGUMENT
-        **kwargs,
-) -> Union[GenerateOutput, torch.LongTensor]:
+    self,
+    inputs: Optional[torch.Tensor] = None,
+    generation_config: Optional[GenerationConfig] = None,
+    logits_processor: Optional[LogitsProcessorList] = None,
+    stopping_criteria: Optional[StoppingCriteriaList] = None,
+    prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+    synced_gpus: Optional[bool] = None,
+    assistant_model: Optional["PreTrainedModel"] = None,
+    streamer: Optional["BaseStreamer"] = None,
+    negative_prompt_ids: Optional[torch.Tensor] = None,
+    negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+    use_model_defaults: Optional[bool] = None,
+    *,  # Force subsequent args to be keyword args
+    table_token: Optional[str] = None,  # New argument for table content
+    **kwargs,
+):
 
-    # 1. Handle `generation_config` and kwargs, validate call
+    # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
     self._validate_model_class()
+    tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
+    assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
 
-    if "table_content" in kwargs:
-        if table_content is None: # Prioritize direct argument
-            table_content = kwargs.pop("table_content")
+    if "table_token" in kwargs:
+        if table_token is None:  # Prioritize direct argument
+            table_token = kwargs.pop("table_token")
         else:
-            kwargs.pop("table_content") # Remove if passed redundantly
+            kwargs.pop("table_token")  # Remove if passed redundantly
 
+    if table_token and tokenizer:
+        logger.info("Processing table_token for injection...")
+        table_token_ids = tokenizer(table_token, return_tensors='pt').input_ids.to(device)
+        self.model.layers[0].mlp.table_content = table_token_ids
+    elif table_token and not tokenizer:
+        logger.warning("`table_token` was provided, but tokenizer is not available on the model instance. Cannot process table.")
 
-    generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
+    generation_config, model_kwargs = self._prepare_generation_config(
+        generation_config, use_model_defaults, **kwargs
+    )
     self._validate_model_kwargs(model_kwargs.copy())
+    self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
 
+    # 2. Set generation parameters if not already defined
     if synced_gpus is None:
-        if is_deepspeed_zero3_enabled() and dist.get_world_size() > 1:
-            synced_gpus = True
-        else:
-            synced_gpus = False
-    
+        synced_gpus = (is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)) and dist.get_world_size() > 1
+
     logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
     stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-    if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
-        if model_kwargs.get("attention_mask", None) is None:
-            logger.warning(
-                    "The attention mask and the pad token id were not set. As a consequence, you may observe "
-                    "unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results."
-            )             
-        eos_token_id = generation_config.eos_token_id
-        if isinstance(eos_token_id, list):
-            eos_token_id = eos_token_id[0]
-        logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
-        generation_config.pad_token_id = eos_token_id
 
+    accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
+    requires_attention_mask = "encoder_outputs" not in model_kwargs
+    kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
 
     # 3. Define model inputs
     inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
@@ -355,135 +374,120 @@ def generate(
     )
     batch_size = inputs_tensor.shape[0]
 
-    # 4. Define other model kwargs (Standard - use_cache, attention_mask, etc.)
-    # ... (paste standard logic for setting output_attentions, output_hidden_states, use_cache, attention_mask) ...
-    model_kwargs["output_attentions"] = generation_config.output_attentions
-    model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
-    if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
-        model_kwargs["use_cache"] = True
-    else:
-        model_kwargs["use_cache"] = generation_config.use_cache
+    device = inputs_tensor.device
+    self._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
 
-    accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
-    requires_attention_mask = "encoder_outputs" not in model_kwargs
-    if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
-        model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
-            inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
-        )
+    # decoder-only models must use left-padding for batched generation.
     if not self.config.is_encoder_decoder:
+        # If `input_ids` was given, check if the last id in any sequence is `pad_token_id`
         if (
-            generation_config.pad_token_id is not None
-                and len(inputs_tensor.shape) == 2
-                and torch.sum(inputs_tensor[:, -1] == generation_config.pad_token_id) > 0
+            generation_config._pad_token_tensor is not None
+            and batch_size > 1
+            and len(inputs_tensor.shape) == 2
+            and torch.sum(inputs_tensor[:, -1] == generation_config._pad_token_tensor) > 0
         ):
-            logger.warning("A decoder-only architecture is being used...") # Shortened warning
+            logger.warning(
+                "A decoder-only architecture is being used, but right-padding was detected! For correct "
+                "generation results, please set `padding_side='left'` when initializing the tokenizer."
+            )
+
+    # 4. Define other model kwargs
+    if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
+        generation_config.use_cache = True
+
+    if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:
+        model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
+            inputs_tensor, generation_config, model_kwargs
+        )
+    elif kwargs_has_attention_mask:
+        if model_input_name == "input_ids" and len(model_kwargs["attention_mask"].shape) > 2:
+            raise ValueError("`attention_mask` passed to `generate` must be 2D.")
 
     if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
+        # If model is encoder-decoder, encoder_outputs are created and added to `model_kwargs`
         model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
-                    inputs_tensor, model_kwargs, model_input_name
+            inputs_tensor, model_kwargs, model_input_name, generation_config
         )
 
-       
-    table_embedding = None
-    tokenizer = getattr(self, "tokenizer", None) # Get tokenizer if available
-     if table_content and tokenizer:
-        logger.info("Processing table_content for injection...")
-        table_embedding = self._process_table_to_embedding(table_content, tokenizer, self.device)
-        if table_embedding is not None:
-            model_kwargs["table_embedding"] = table_embedding
-            logger.info(f"Added table_embedding (shape: {table_embedding.shape}) to model_kwargs.")
-        else:
-            logger.warning("Failed to process table_content into embedding. Injection skipped for this call.")
-    elif table_content and not tokenizer:
-        logger.warning("`table_content` was provided, but tokenizer is not available on the model instance. Cannot process table.")
-
-
-    # ====================================================================
-    # END OF ***ADDED*** CODE
-    # ====================================================================
-
-
-    # 5. Prepare `input_ids` for auto-regressive generation
-    # ... (standard logic for preparing input_ids for decoder/encoder-decoder) ...
+    # 5. Prepare `input_ids` which will be used for auto-regressive generation
     if self.config.is_encoder_decoder:
         input_ids, model_kwargs = self._prepare_decoder_input_ids_for_generation(
-                 batch_size=batch_size, model_input_name=model_input_name, model_kwargs=model_kwargs,
-                 decoder_start_token_id=generation_config.decoder_start_token_id,
-                 bos_token_id=generation_config.bos_token_id, device=inputs_tensor.device,
+            batch_size=batch_size,
+            model_input_name=model_input_name,
+            model_kwargs=model_kwargs,
+            decoder_start_token_id=generation_config._decoder_start_token_tensor,
+            device=inputs_tensor.device,
         )
     else:
         input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
 
+    if generation_config.token_healing:
+        input_ids = self.heal_tokens(input_ids, tokenizer)
 
     if streamer is not None:
         streamer.put(input_ids.cpu())
 
-    # 6. Prepare `max_length`
-    # ... (standard logic using _prepare_generated_length) ...
+    # 6. Prepare `max_length` depending on other stopping criteria.
     input_ids_length = input_ids.shape[-1]
     has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
     has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
     generation_config = self._prepare_generated_length(
-             generation_config=generation_config, has_default_max_length=has_default_max_length,
-             has_default_min_length=has_default_min_length, model_input_name=model_input_name,
-             inputs_tensor=inputs_tensor, input_ids_length=input_ids_length,
-        )
+        generation_config=generation_config,
+        has_default_max_length=has_default_max_length,
+        has_default_min_length=has_default_min_length,
+        model_input_name=model_input_name,
+        inputs_tensor=inputs_tensor,
+        input_ids_length=input_ids_length,
+    )
 
+    # 7. Prepare the cache.
+    max_cache_length = generation_config.max_length - 1
+    if (
+        inputs_tensor.shape[1] != input_ids_length
+        and model_input_name == "inputs_embeds"
+        and not self.config.is_encoder_decoder
+    ):
+        max_cache_length += inputs_tensor.shape[1]
+    self._prepare_cache_for_generation(
+        generation_config, model_kwargs, assistant_model, batch_size, max_cache_length, device
+    )
 
-    # Static Cache setup (if needed)
-    if generation_config.cache_implementation in NEED_SETUP_CACHE_CLASSES_MAPPING:
-        if generation_config.cache_implementation == "static":
-            if model_kwargs.get("past_key_values", False) is not False:
-                raise ValueError(
-                    "Using `past_key_values` argument with `generate()` when using a static KV cache is not supported. Please open an issue in Transformers GitHub repository."
-                )
-            cache_cls = NEED_SETUP_CACHE_CLASSES_MAPPING["static"]
-            if not callable(getattr(self, "_setup_cache", None)):
-                raise ValueError(
-                    "The `generation_config` defines a `cache_implementation` that is not compatible with this model."
-                    " Make sure it has a `_setup_cache` function."
-                )
-            self._setup_cache(cache_cls, max_batch_size=batch_size, max_cache_len=generation_config.max_length)
-
-
-    self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
-
-
-    # 7. Determine generation mode
+    # 8. Determine generation mode
     generation_mode = generation_config.get_generation_mode(assistant_model)
 
-    # Check streamer compatibility
     if streamer is not None and (generation_config.num_beams > 1):
-        raise ValueError("`streamer` cannot be used with beam search...")
-
-    # Device check warning
-    # ... (standard device check warning logic) ...
-    if self.device.type != input_ids.device.type:
-        warnings.warn(
-                "You are calling .generate() with the `input_ids` being on a device type different"
-                f" than your model's device. `input_ids` is on {input_ids.device.type}, whereas the model"
-                f" is on {self.device.type}. You may experience unexpected behaviors or slower generation."
-                " Please make sure that you have put `input_ids` to the"
-                f" correct device by calling for example input_ids = input_ids.to('{self.device.type}') before"
-                " running `.generate()`.",
-                UserWarning,
+        raise ValueError(
+            "`streamer` cannot be used with beam search (yet!). Make sure that `num_beams` is set to 1."
         )
 
-    # 8. Prepare logits processors
+    if self.device.type != input_ids.device.type:
+        warnings.warn(
+            "You are calling .generate() with the `input_ids` being on a device type different"
+            f" than your model's device. `input_ids` is on {input_ids.device.type}, whereas the model"
+            f" is on {self.device.type}. You may experience unexpected behaviors or slower generation."
+            " Please make sure that you have put `input_ids` to the"
+            f" correct device by calling for example input_ids = input_ids.to('{self.device.type}') before"
+            " running `.generate()`.",
+            UserWarning,
+        )
+
+    # 9. Prepare logits processors and stopping criteria
     prepared_logits_processor = self._get_logits_processor(
-            generation_config=generation_config, input_ids_seq_length=input_ids_length,
-            encoder_input_ids=inputs_tensor, prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-            logits_processor=logits_processor, model_kwargs=model_kwargs,
-            negative_prompt_ids=negative_prompt_ids, negative_prompt_attention_mask=negative_prompt_attention_mask,
+        generation_config=generation_config,
+        input_ids_seq_length=input_ids_length,
+        encoder_input_ids=inputs_tensor,
+        prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+        logits_processor=logits_processor,
+        device=inputs_tensor.device,
+        model_kwargs=model_kwargs,
+        negative_prompt_ids=negative_prompt_ids,
+        negative_prompt_attention_mask=negative_prompt_attention_mask,
     )
-
-    # 9. Prepare stopping criteria
     prepared_stopping_criteria = self._get_stopping_criteria(
-        generation_config=generation_config, stopping_criteria=stopping_criteria
+        generation_config=generation_config, stopping_criteria=stopping_criteria, tokenizer=tokenizer, **kwargs
     )
 
-
-
+    # 10. go into different generation modes
     if generation_mode == GenerationMode.ASSISTED_GENERATION:
         if generation_config.num_return_sequences > 1:
             raise ValueError(
@@ -494,6 +498,14 @@ def generate(
             raise ValueError("assisted generate is only supported for batch_size = 1")
         if not model_kwargs["use_cache"]:
             raise ValueError("assisted generate requires `use_cache=True`")
+        if generation_config.cache_implementation in ["static", "hybrid", "sliding_window"]:
+            raise ValueError("assisted generate is not supported with Static cache classes`")
+        if self._is_stateful:
+            # In assisted generation we need the ability to confirm whether the model would pick certain tokens,
+            # which is not possible with stateful models (they can't reset to a previous subset of generated text)
+            raise ValueError(
+                f"assisted generation is not supported with stateful models, such as {self.__class__.__name__}"
+            )
 
         # 11. Get the candidate generator, given the parameterization
         candidate_generator = self._get_candidate_generator(
@@ -502,6 +514,8 @@ def generate(
             inputs_tensor=inputs_tensor,
             assistant_model=assistant_model,
             logits_processor=logits_processor,
+            target_tokenizer=tokenizer,
+            assistant_tokenizer=assistant_tokenizer,
             model_kwargs=model_kwargs,
         )
 
@@ -509,29 +523,25 @@ def generate(
         result = self._assisted_decoding(
             input_ids,
             candidate_generator=candidate_generator,
-            do_sample=generation_config.do_sample,
             logits_processor=prepared_logits_processor,
-            logits_warper=self._get_logits_warper(generation_config) if generation_config.do_sample else None,
             stopping_criteria=prepared_stopping_criteria,
-            pad_token_id=generation_config.pad_token_id,
-            output_scores=generation_config.output_scores,
-            output_logits=generation_config.output_logits,
-            return_dict_in_generate=generation_config.return_dict_in_generate,
+            generation_config=generation_config,
             synced_gpus=synced_gpus,
             streamer=streamer,
             **model_kwargs,
         )
-   
-    if generation_mode == GenerationMode.GREEDY_SEARCH:
-        # 11. run greedy search
-        result = self._greedy_search(
+    elif generation_mode == GenerationMode.DOLA_GENERATION:
+        if self._is_stateful:
+            # DoLa decoding was not designed for stateful models, and would require some changes
+            raise ValueError(
+                f"dola decoding is not supported with stateful models, such as {self.__class__.__name__}"
+            )
+        result = self._dola_decoding(
             input_ids,
+            dola_layers=generation_config.dola_layers,
             logits_processor=prepared_logits_processor,
             stopping_criteria=prepared_stopping_criteria,
-            pad_token_id=generation_config.pad_token_id,
-            output_scores=generation_config.output_scores,
-            output_logits=generation_config.output_logits,
-            return_dict_in_generate=generation_config.return_dict_in_generate,
+            generation_config=generation_config,
             synced_gpus=synced_gpus,
             streamer=streamer,
             **model_kwargs,
@@ -540,28 +550,24 @@ def generate(
     elif generation_mode == GenerationMode.CONTRASTIVE_SEARCH:
         if not model_kwargs["use_cache"]:
             raise ValueError("Contrastive search requires `use_cache=True`")
+        if self._is_stateful:
+            # Just like assisted generation, we need to be able to rollback to a previous state (see comment above)
+            raise ValueError(
+                f"contrastive search is not supported with stateful models, such as {self.__class__.__name__}"
+            )
 
         result = self._contrastive_search(
             input_ids,
-            top_k=generation_config.top_k,
-            penalty_alpha=generation_config.penalty_alpha,
             logits_processor=prepared_logits_processor,
             stopping_criteria=prepared_stopping_criteria,
-            pad_token_id=generation_config.pad_token_id,
-            output_scores=generation_config.output_scores,
-            output_logits=generation_config.output_logits,
-            return_dict_in_generate=generation_config.return_dict_in_generate,
+            generation_config=generation_config,
             synced_gpus=synced_gpus,
             streamer=streamer,
-            sequential=generation_config.low_memory,
             **model_kwargs,
         )
 
-    elif generation_mode == GenerationMode.SAMPLE:
-        # 11. prepare logits warper
-        logits_warper = self._get_logits_warper(generation_config)
-
-        # 12. expand input_ids with `num_return_sequences` additional sequences per batch
+    elif generation_mode in (GenerationMode.SAMPLE, GenerationMode.GREEDY_SEARCH):
+        # 11. expand input_ids with `num_return_sequences` additional sequences per batch
         input_ids, model_kwargs = self._expand_inputs_for_generation(
             input_ids=input_ids,
             expand_size=generation_config.num_return_sequences,
@@ -569,88 +575,31 @@ def generate(
             **model_kwargs,
         )
 
-        # 13. run sample
+        # 12. run sample (it degenerates to greedy search when `generation_config.do_sample=False`)
         result = self._sample(
             input_ids,
             logits_processor=prepared_logits_processor,
-            logits_warper=logits_warper,
             stopping_criteria=prepared_stopping_criteria,
-            pad_token_id=generation_config.pad_token_id,
-            output_scores=generation_config.output_scores,
-            output_logits=generation_config.output_logits,
-            return_dict_in_generate=generation_config.return_dict_in_generate,
+            generation_config=generation_config,
             synced_gpus=synced_gpus,
             streamer=streamer,
             **model_kwargs,
         )
 
-    elif generation_mode == GenerationMode.BEAM_SEARCH:
-        # 11. prepare beam search scorer
-        beam_scorer = BeamSearchScorer(
-            batch_size=batch_size,
-            num_beams=generation_config.num_beams,
-            device=inputs_tensor.device,
-            length_penalty=generation_config.length_penalty,
-            do_early_stopping=generation_config.early_stopping,
-            num_beam_hyps_to_keep=generation_config.num_return_sequences,
-            max_length=generation_config.max_length,
-        )
-        # 12. interleave input_ids with `num_beams` additional sequences per batch
+    elif generation_mode in (GenerationMode.BEAM_SAMPLE, GenerationMode.BEAM_SEARCH):
+        # 11. interleave input_ids with `num_beams` additional sequences per batch
         input_ids, model_kwargs = self._expand_inputs_for_generation(
             input_ids=input_ids,
             expand_size=generation_config.num_beams,
             is_encoder_decoder=self.config.is_encoder_decoder,
             **model_kwargs,
         )
-        # 13. run beam search
+        # 12. run beam sample
         result = self._beam_search(
             input_ids,
-            beam_scorer,
             logits_processor=prepared_logits_processor,
             stopping_criteria=prepared_stopping_criteria,
-            pad_token_id=generation_config.pad_token_id,
-            output_scores=generation_config.output_scores,
-            output_logits=generation_config.output_logits,
-            return_dict_in_generate=generation_config.return_dict_in_generate,
-            synced_gpus=synced_gpus,
-            sequential=generation_config.low_memory,
-            **model_kwargs,
-        )
-
-    elif generation_mode == GenerationMode.BEAM_SAMPLE:
-        # 11. prepare logits warper
-        logits_warper = self._get_logits_warper(generation_config)
-
-        # 12. prepare beam search scorer
-        beam_scorer = BeamSearchScorer(
-            batch_size=batch_size,
-            num_beams=generation_config.num_beams,
-            device=inputs_tensor.device,
-            length_penalty=generation_config.length_penalty,
-            do_early_stopping=generation_config.early_stopping,
-            num_beam_hyps_to_keep=generation_config.num_return_sequences,
-            max_length=generation_config.max_length,
-        )
-
-        # 13. interleave input_ids with `num_beams` additional sequences per batch
-        input_ids, model_kwargs = self._expand_inputs_for_generation(
-            input_ids=input_ids,
-            expand_size=generation_config.num_beams,
-            is_encoder_decoder=self.config.is_encoder_decoder,
-            **model_kwargs,
-        )
-
-        # 14. run beam sample
-        result = self._beam_sample(
-            input_ids,
-            beam_scorer,
-            logits_processor=prepared_logits_processor,
-            logits_warper=logits_warper,
-            stopping_criteria=prepared_stopping_criteria,
-            pad_token_id=generation_config.pad_token_id,
-            output_scores=generation_config.output_scores,
-            output_logits=generation_config.output_logits,
-            return_dict_in_generate=generation_config.return_dict_in_generate,
+            generation_config=generation_config,
             synced_gpus=synced_gpus,
             **model_kwargs,
         )
@@ -680,10 +629,7 @@ def generate(
             beam_scorer,
             logits_processor=prepared_logits_processor,
             stopping_criteria=prepared_stopping_criteria,
-            pad_token_id=generation_config.pad_token_id,
-            output_scores=generation_config.output_scores,
-            output_logits=generation_config.output_logits,
-            return_dict_in_generate=generation_config.return_dict_in_generate,
+            generation_config=generation_config,
             synced_gpus=synced_gpus,
             **model_kwargs,
         )
@@ -753,27 +699,25 @@ def generate(
             constrained_beam_scorer=constrained_beam_scorer,
             logits_processor=prepared_logits_processor,
             stopping_criteria=prepared_stopping_criteria,
-            pad_token_id=generation_config.pad_token_id,
-            output_scores=generation_config.output_scores,
-            output_logits=generation_config.output_logits,
-            return_dict_in_generate=generation_config.return_dict_in_generate,
+            generation_config=generation_config,
             synced_gpus=synced_gpus,
             **model_kwargs,
         )
 
-    # Reset static cache if used
-    if generation_config.cache_implementation in NEED_SETUP_CACHE_CLASSES_MAPPING:
-        if not callable(getattr(self, "_reset_cache", None)):
-            raise ValueError(
-                    "A `static_cache` was used to generate but there was a failure when trying to  release the cache. "
-                    " Make sure this model implements a `_reset_cache` function."
-            )
-        self._reset_cache()
+    # Convert to legacy cache format if requested
+    if (
+        generation_config.return_legacy_cache is True
+        and hasattr(result, "past_key_values")
+        and getattr(result.past_key_values, "to_legacy_cache") is not None
+    ):
+        result.past_key_values = result.past_key_values.to_legacy_cache()
 
     return result
 
-
-
+def apply_table_function():
+    transformers.models.llama.modeling_llama.LlamaMLP = LlamaMLP
+    transformers.models.llama.modeling_llama.LlamaModel.forward = table_forward
+    transformers.models.llama.modeling_llama.LlamaForCausalLM.generate = generate
 
 def apply_table_llama(
         self,
@@ -782,13 +726,12 @@ def apply_table_llama(
         entropy_threshold: float,
         retracing_ratio: float
     ):
-    transformers.models.llama.modeling_llama.LlamaMLP = LlamaMLP
-    transformers.models.llama.modeling_llama.LlamaModel.forward = table_forward
-
     self.model.lm_head = self.lm_head
-    self.model.layers[0].mlp.apply_memvr = True
+    self.model.layers[0].mlp.apply_table_injection = True
     self.model.layers[0].mlp.starting_layer = starting_layer
     self.model.layers[0].mlp.ending_layer = ending_layer
     self.model.layers[0].mlp.entropy_threshold = entropy_threshold
-    for layer in range(31):
+    for layer in range(len(self.model.layers)):
+        # 直接替换 mlp 实例
         self.model.layers[layer].mlp.retracing_ratio = retracing_ratio
+
