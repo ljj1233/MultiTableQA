@@ -136,25 +136,68 @@ class LlamaMLP(nn.Module):
 
         return down_proj
 
-    def initialize_adapter_weights(self,table_embedding):
+    def initialize_adapter_weights(self, table_embedding):
         """Initializes adapter weights based on the table embedding."""
         if table_embedding is None:
+            print("Info: table_embedding is None in initialize_adapter_weights. Skipping initialization.")
             self.adpt_w1 = None
             self.adpt_w2 = None
             return
 
-        table_embedding = table_embedding.to(self.gate_proj.weight.device)
+        target_device = self.gate_proj.weight.device
+        target_dtype = self.gate_proj.weight.dtype
+        table_embedding = table_embedding.to(target_device, dtype=target_dtype)
 
-        scale_factor1 = (torch.mean(torch.abs(self.up_proj.weight))) / (torch.mean(torch.abs(table_embedding)).clamp(min=1e-6))
-        scale_factor2 = (torch.mean(torch.abs(self.down_proj.weight))) / (torch.mean(torch.abs(table_embedding)).clamp(min=1e-6))
+        original_shape = table_embedding.shape
+        processed_embedding = None
 
- 
-        init_w1 = (scale_factor1 * table_embedding).unsqueeze(0).repeat(self.hidden_size, 1)
-        init_w2 = (scale_factor2 * table_embedding).unsqueeze(1).repeat(1, self.hidden_size)
+        # --- MODIFIED SHAPE HANDLING ---
+        if table_embedding.ndim == 1 and table_embedding.shape[0] == self.hidden_size:
+            # Shape (H,) - Already correct
+            processed_embedding = table_embedding
 
-        self.adpt_w1 = init_w1 # Shape (H, H) -> Matmul needs (H, H).T
-        self.adpt_w2 = init_w2 # Shape (H, H) -> Matmul needs (H, H).T
+        elif table_embedding.ndim == 2 and table_embedding.shape[0] == 1 and table_embedding.shape[1] == self.hidden_size:
+            # Shape (1, H) -> Squeeze to (H,)
+            processed_embedding = table_embedding.squeeze(0)
 
+        elif table_embedding.ndim == 3 and table_embedding.shape[0] == 1 and table_embedding.shape[2] == self.hidden_size:
+            # --- ADDED CASE for (1, Sequence Length, H) ---
+            # Assume Sequence Length > 1 (like the error case 1, 51, 4096)
+            # Or Sequence Length == 1 (like 1, 1, 4096)
+            # Calculate mean over the sequence dimension (dim=1)
+            averaged_embedding = table_embedding.mean(dim=1) # Shape becomes (1, H)
+            # Squeeze the batch dimension (dim=0)
+            processed_embedding = averaged_embedding.squeeze(0) # Shape becomes (H,)
+
+        else:
+             # If shape is still unexpected
+             self.adpt_w1 = None
+             self.adpt_w2 = None
+             return
+        # --- END OF MODIFIED SHAPE HANDLING ---
+
+        # --- Check final shape after processing ---
+        if processed_embedding is None or processed_embedding.ndim != 1 or processed_embedding.shape[0] != self.hidden_size:
+             self.adpt_w1 = None
+             self.adpt_w2 = None
+             return
+
+        # Now processed_embedding should have shape (H,)
+        epsilon = 1e-6
+        # Ensure weight dtype matches embedding dtype for calculations
+        up_weight = self.up_proj.weight.to(dtype=target_dtype)
+        down_weight = self.down_proj.weight.to(dtype=target_dtype)
+
+        scale_factor1 = (torch.mean(torch.abs(up_weight))) / (torch.mean(torch.abs(processed_embedding)).clamp(min=epsilon))
+        scale_factor2 = (torch.mean(torch.abs(down_weight))) / (torch.mean(torch.abs(processed_embedding)).clamp(min=epsilon))
+
+        # Original logic now works correctly because processed_embedding is (H,)
+        init_w1 = (scale_factor1 * processed_embedding).unsqueeze(0).repeat(self.hidden_size, 1) # (H, H)
+        init_w2 = (scale_factor2 * processed_embedding).unsqueeze(1).repeat(1, self.hidden_size) # (H, H)
+
+        # Assign initialized weights
+        self.adpt_w1 = init_w1
+        self.adpt_w2 = init_w2
 
 def table_forward(
         self,
@@ -278,7 +321,6 @@ def table_forward(
             entropy = -torch.sum(probabilities * torch.log(probabilities.clamp(min=epsilon_log)), dim=-1)
             entropy = entropy / np.log(k_topk)
             avg_entropy = torch.mean(entropy).item()
-            print(avg_entropy)
             if avg_entropy > entropy_threshold:
                 table_retracing_event = True 
                 next_layer_mlp = self.layers[layer_idx + 1].mlp
@@ -286,7 +328,7 @@ def table_forward(
                 current_table_token = self.layers[0].mlp.table_content.to(input_ids.device)  # Retrieve shared token
                 table_embeds = self.embed_tokens(current_table_token)
                 next_layer_mlp.initialize_adapter_weights(table_embeds)
-
+                print(f"add table feautre to layer {layer_idx}")
                 next_layer_mlp.adapt_signal = 1
                 next_layer_mlp.retracing_ratio = retracing_ratio
         if decoder_layer.mlp.adapt_signal == 1:
@@ -730,5 +772,6 @@ def apply_table_llama(
     self.model.layers[0].mlp.ending_layer = ending_layer
     self.model.layers[0].mlp.entropy_threshold = entropy_threshold
     for layer in range(len(self.model.layers)):
+        # 直接替换 mlp 实例
         self.model.layers[layer].mlp.retracing_ratio = retracing_ratio
 
