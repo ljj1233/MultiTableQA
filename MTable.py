@@ -283,14 +283,12 @@ def table_forward(
                 table_retracing_event = True 
                 next_layer_mlp = self.layers[layer_idx + 1].mlp
 
-                current_table_token = self.layers[0].mlp.table_content   # Retrieve shared token
-                print(current_table_token)
+                current_table_token = self.layers[0].mlp.table_content.to(input_ids.device)  # Retrieve shared token
                 table_embeds = self.embed_tokens(current_table_token)
                 next_layer_mlp.initialize_adapter_weights(table_embeds)
 
                 next_layer_mlp.adapt_signal = 1
                 next_layer_mlp.retracing_ratio = retracing_ratio
-                print(f'add table content to {layer_idx+1}')
         if decoder_layer.mlp.adapt_signal == 1:
             decoder_layer.mlp.adapt_signal = 0
             decoder_layer.mlp.adpt_w1 = None
@@ -346,7 +344,7 @@ def generate(
 
     if table_token and tokenizer:
         logger.info("Processing table_token for injection...")
-        table_token_ids = tokenizer(table_token, return_tensors='pt').input_ids.to(device)
+        table_token_ids = tokenizer(table_token, return_tensors='pt').input_ids
         self.model.layers[0].mlp.table_content = table_token_ids
     elif table_token and not tokenizer:
         logger.warning("`table_token` was provided, but tokenizer is not available on the model instance. Cannot process table.")
