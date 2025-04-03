@@ -730,6 +730,5 @@ def apply_table_llama(
     self.model.layers[0].mlp.ending_layer = ending_layer
     self.model.layers[0].mlp.entropy_threshold = entropy_threshold
     for layer in range(len(self.model.layers)):
-        # 直接替换 mlp 实例
         self.model.layers[layer].mlp.retracing_ratio = retracing_ratio
 
