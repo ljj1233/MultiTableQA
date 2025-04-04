@@ -774,3 +774,19 @@ def apply_table_function():
     transformers.models.llama.modeling_llama.LlamaModel.forward = table_forward
     transformers.models.llama.modeling_llama.LlamaForCausalLM.generate = generate
 
+
+def apply_table_llama(
+        self,
+        starting_layer: int,
+        ending_layer: int,
+        entropy_threshold: float,
+        retracing_ratio: float
+    ):
+    self.model.lm_head = self.lm_head
+    self.model.layers[0].mlp.apply_table_injection = True
+    self.model.layers[0].mlp.starting_layer = starting_layer
+    self.model.layers[0].mlp.ending_layer = ending_layer
+    self.model.layers[0].mlp.entropy_threshold = entropy_threshold
+    for layer in range(len(self.model.layers)):
+        self.model.layers[layer].mlp.retracing_ratio = retracing_ratio
+
