@@ -4,9 +4,11 @@
 
 ## 项目结构
 
-- `MTable.py`: 实现表格增强功能的核心逻辑
-- `table_qa_evaluator.py`: 主要入口文件，负责模型加载和评估
-- `Utils/dataLoader.py`: 数据加载和结果记录工具
+- `multi_Table.py`: 实现表格增强功能的核心逻辑
+- `open_model_evaluator.py`: 开源模型评估工具，用于评估本地模型性能
+- `api_model_evaluator.py`: API模型评估工具，用于评估OpenAI/Claude等API模型性能
+- `eval/`: 评估工具包，包含评估函数和工具
+- `Utils/jsTool.py`: 数据加载和结果记录工具
 
 ## 运行流程
 
@@ -16,8 +18,8 @@
    - 配置提示类型（原始/思维链/表格增强）
 
 2. **数据加载阶段**
-   - 连接任务数据库和结果数据库
    - 加载表格、问题和选项数据
+   - 准备评估数据集
 
 3. **评估循环**
    - 遍历数据集中的每个问题
@@ -35,12 +37,32 @@
 
 ## 使用方法
 
+### 1. 评估开源模型
+
+使用`open_model_evaluator.py`评估本地部署的开源模型：
+
 ```bash
-python d:\NLP\MultiTableQA\table_qa_evaluator.py \
-  --model_path path/to/model \
-  --db_root path/to/db \
-  --task_path path/to/task.sqlite \
-  --result_path path/to/result.sqlite \
-  --dataset dataset_name \
-  --scale small \
-  --prompt_type [default|cot|retrace_table]
+# 默认提示模式评估
+python d:\NLP\MultiTableQA\open_model_evaluator.py \
+  --model_path D:\Models\Meta-Llama-3.1-8B-Instruct \
+  --dataset qa \
+  --scale 16k \
+  --prompt_type default
+
+# 思维链(CoT)提示模式评估
+python d:\NLP\MultiTableQA\open_model_evaluator.py \
+  --model_path D:\Models\Meta-Llama-3.1-8B-Instruct \
+  --dataset qa \
+  --scale 16k \
+  --prompt_type cot \
+  --result_path d:\NLP\MultiTableQA\results\qa_cot_result.json
+
+# 表格增强提示模式评估
+python d:\NLP\MultiTableQA\open_model_evaluator.py \
+  --model_path D:\Models\Meta-Llama-3.1-8B-Instruct \
+  --dataset qa \
+  --scale 16k \
+  --prompt_type retrace_table \
+  --markdown \
+  --log_root d:\NLP\MultiTableQA\logs\qa_retrace
+```
