@@ -69,6 +69,7 @@ class TaskCore:
         self.resultConn.commit()
 
     def loadTaskItem(self, dbn, scale, dbIdx, sampleIdx, questionIdx):
+
         self.taskCur.execute(
             "SELECT * FROM {dbn} WHERE scale=? AND dbIdx=? AND sampleIdx=? AND questionIdx=?;".format(
                 dbn=dbn

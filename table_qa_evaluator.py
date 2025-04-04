@@ -149,20 +149,43 @@ class TableQAEvaluator:
         # 创建一个包装函数，将prompt_type传递给answer_question
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
             return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type)
-        
-        # 运行评估
-        task_core.testAll(
-            model=model_name,
-            dbn=db_root,
-            scale=scale,
-            markdown=markdown,
-            dbLimit=db_limit,
-            sampleLimit=sample_limit,
-            questionLimit=question_limit,
-            func=wrapped_answer_func,
-            timeSleep=time_sleep
-        )
-        
+        from symbolic import dataDict
+        database_list = list(dataDict.keys())
+        print(database_list)
+        for dbn in tqdm(database_list, desc="database_list"):
+            # 根据不同规模设置等待时间
+            current_time_sleep = time_sleep
+            if isinstance(scale, list):
+                # 如果scale是列表，使用传入的scale列表
+                scale_list = scale
+            else:
+                # 如果scale是单个值，转换为列表
+                scale_list = [scale]
+            
+            for current_scale in scale_list:
+                # 根据不同规模设置等待时间
+                if current_scale == '16k':
+                    current_time_sleep = 20
+                elif current_scale == '32k':
+                    current_time_sleep = 30
+                elif current_scale == '64k':
+                    current_time_sleep = 40
+                else:
+                    current_time_sleep = 5
+                
+                # 运行评估
+                task_core.testAll(
+                    model=model_name,
+                    dbn=dbn,
+                    scale=current_scale,
+                    markdown=markdown,
+                    dbLimit=db_limit,
+                    sampleLimit=sample_limit,
+                    questionLimit=question_limit,
+                    func=wrapped_answer_func,
+                    timeSleep=current_time_sleep
+                )
+            
         print(f"评估完成，结果已保存到 {result_path}")
 
 def main():
