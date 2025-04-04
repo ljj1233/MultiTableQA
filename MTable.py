@@ -79,13 +79,13 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
         # --- Table Injection Parameters ---
-        self.apply_table_injection = False # Global flag (set during setup)
-        self.table_content = None         # Will hold the precomputed table embedding (set per-input)
-        self.retracing_ratio = 0        # Injection strength (set during setup)
-        self.entropy_threshold = 1.0    # Trigger threshold (set during setup)
-        self.starting_layer = 0         # Layer range start (set during setup)
-        self.ending_layer = 32          # Layer range end (set during setup, adjust based on model)
-        self.adapt_signal = 0           # 0: Normal FFN, 1: Inject Table Info
+        self.apply_table_injection = False  # 全局开关，控制是否启用表格注入
+        self.table_token = None           # 存储表格的嵌入表示
+        self.retracing_ratio = 0            # 注入强度，控制表格特征的影响程度
+        self.entropy_threshold = 1.0        # 触发阈值，当模型熵值超过此值时触发注入
+        self.starting_layer = 0             # 开始注入的层
+        self.ending_layer = 32              # 结束注入的层
+        self.adapt_signal = 0               # 控制信号：0表示正常FFN，1表示注入表格信息
 
         # Adapter weights - initialized when triggered
         self.adpt_w1 = None
@@ -261,16 +261,18 @@ def table_forward(
 
     # --- Table Injection Setup ---
     # Get global settings from the first layer's MLP
-
-
     first_mlp = self.layers[0].mlp
-    apply_table_injection =self.layers[0].mlp.apply_table_injection  # Check if injection is enabled
+    apply_table_injection = self.layers[0].mlp.apply_table_injection  # Check if injection is enabled
+    
+    # 检查是否有表格内容，如果没有则禁用表格注入
+    has_table_content = hasattr(first_mlp, 'table_token') and first_mlp.table_token is not None
+    if not has_table_content:
+        apply_table_injection = False
 
     entropy_threshold = getattr(first_mlp, 'entropy_threshold', 1.0)
     starting_layer = getattr(first_mlp, 'starting_layer', 0)
     ending_layer = getattr(first_mlp, 'ending_layer', len(self.layers))
     retracing_ratio = getattr(first_mlp, 'retracing_ratio', 0.0) # Need this for initialization scale
-    table_token   = getattr(first_mlp, 'table_content', 0.0)
     table_retracing_event = False # Flag to ensure trigger happens only once per forward pass
 
     for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
@@ -305,8 +307,14 @@ def table_forward(
 
         if output_attentions:
             all_self_attns += (layer_outputs[1],)
+            
         # --- Entropy Calculation and Trigger Logic ---
-        if apply_table_injection and not table_retracing_event and layer_idx >= starting_layer and layer_idx <=ending_layer : # Check if within range AND not the very last layer
+        # 只有当apply_table_injection为True且有表格内容时才进行熵计算和触发逻辑
+        if (apply_table_injection and has_table_content and 
+            not table_retracing_event and 
+            layer_idx >= starting_layer and 
+            layer_idx <= ending_layer): 
+            
             norm_hidden_states = self.norm(hidden_states)
             logits = self.lm_head(norm_hidden_states)
             last_token_logits = logits[:, -1, :]
@@ -315,7 +323,7 @@ def table_forward(
             # Calculate entropy (using top-k approximation like LLaVA for efficiency)
             k_topk = 10  
             top_k_scores, _ = torch.topk(last_token_logits, k_topk)
-            probabilities  = F.softmax(top_k_scores, dim=-1)
+            probabilities = F.softmax(top_k_scores, dim=-1)
 
             epsilon_log = 1e-9
             entropy = -torch.sum(probabilities * torch.log(probabilities.clamp(min=epsilon_log)), dim=-1)
@@ -325,12 +333,13 @@ def table_forward(
                 table_retracing_event = True 
                 next_layer_mlp = self.layers[layer_idx + 1].mlp
 
-                current_table_token = self.layers[0].mlp.table_content.to(input_ids.device)  # Retrieve shared token
+                current_table_token = self.layers[0].mlp.table_token.to(input_ids.device)  # Retrieve shared token
                 table_embeds = self.embed_tokens(current_table_token)
                 next_layer_mlp.initialize_adapter_weights(table_embeds)
-                print(f"add table feautre to layer {layer_idx}")
+                print(f"add table feature to layer {layer_idx}")
                 next_layer_mlp.adapt_signal = 1
                 next_layer_mlp.retracing_ratio = retracing_ratio
+                
         if decoder_layer.mlp.adapt_signal == 1:
             decoder_layer.mlp.adapt_signal = 0
             decoder_layer.mlp.adpt_w1 = None
@@ -384,10 +393,16 @@ def generate(
         else:
             kwargs.pop("table_token")  # Remove if passed redundantly
 
+    # 处理表格内容，如果为None或空字符串，则清除之前的表格内容
     if table_token and tokenizer:
         logger.info("Processing table_token for injection...")
         table_token_ids = tokenizer(table_token, return_tensors='pt').input_ids
-        self.model.layers[0].mlp.table_content = table_token_ids
+        self.model.layers[0].mlp.table_token = table_token_ids
+    elif table_token is None or table_token.strip() == "":
+        # 如果表格内容为None或空字符串，清除之前的表格内容
+        logger.info("No table_token provided, disabling table injection...")
+        if hasattr(self.model.layers[0].mlp, 'table_token'):
+            self.model.layers[0].mlp.table_token = None
     elif table_token and not tokenizer:
         logger.warning("`table_token` was provided, but tokenizer is not available on the model instance. Cannot process table.")
 
@@ -758,20 +773,4 @@ def apply_table_function():
     transformers.models.llama.modeling_llama.LlamaMLP = LlamaMLP
     transformers.models.llama.modeling_llama.LlamaModel.forward = table_forward
     transformers.models.llama.modeling_llama.LlamaForCausalLM.generate = generate
-
-def apply_table_llama(
-        self,
-        starting_layer: int,
-        ending_layer: int,
-        entropy_threshold: float,
-        retracing_ratio: float
-    ):
-    self.model.lm_head = self.lm_head
-    self.model.layers[0].mlp.apply_table_injection = True
-    self.model.layers[0].mlp.starting_layer = starting_layer
-    self.model.layers[0].mlp.ending_layer = ending_layer
-    self.model.layers[0].mlp.entropy_threshold = entropy_threshold
-    for layer in range(len(self.model.layers)):
-        # 直接替换 mlp 实例
-        self.model.layers[layer].mlp.retracing_ratio = retracing_ratio
 
