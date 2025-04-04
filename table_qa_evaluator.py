@@ -173,7 +173,9 @@ def main():
     parser.add_argument("--task_path", type=str, required=True, help="任务文件路径")
     parser.add_argument("--result_path", type=str, required=True, help="结果保存路径")
     parser.add_argument("--dataset", type=str, required=True, help="数据集名称")
-    parser.add_argument("--scale", type=str, default="small", help="数据规模")
+    parser.add_argument("--scale", type=str, nargs='+', default=["8k"], 
+                        choices=["8k", "16k", "32k", "64k", "128k"],
+                        help="数据规模，可指定多个值，如: 8k 16k 32k")
     parser.add_argument("--markdown", action="store_true", help="使用markdown格式")
     parser.add_argument("--db_limit", type=int, default=5, help="数据库数量限制")
     parser.add_argument("--sample_limit", type=int, default=5, help="每个数据库的样本数量限制")
@@ -189,26 +191,35 @@ def main():
     evaluator = TableQAEvaluator(args.model_path)
     
     # 如果不使用表格增强功能，则禁用它
-    if args.prompt_type != "retrace_table" :
-        # 禁用表格增强功能的代码
+    if args.prompt_type != "retrace_table":
         for layer in evaluator.model.model.layers:
             if hasattr(layer.mlp, 'apply_table_injection'):
                 layer.mlp.apply_table_injection = False
     
-    # 运行评估
-    evaluator.run_evaluation(
-        db_root=args.db_root,
-        task_path=args.task_path,
-        result_path=args.result_path,
-        dataset_name=args.dataset,
-        scale=args.scale,
-        markdown=args.markdown,
-        db_limit=args.db_limit,
-        sample_limit=args.sample_limit,
-        question_limit=args.question_limit,
-        time_sleep=args.time_sleep,
-        prompt_type=args.prompt_type
-    )
+    # 对每个scale进行评估
+    for scale in args.scale:
+        # 根据scale设置time_sleep
+        time_sleep = 0
+        if scale == "16k":
+            time_sleep = 30
+        elif scale == "32k":
+            time_sleep = 60
+            
+        print(f"\n开始评估 scale={scale}")
+        # 运行评估
+        evaluator.run_evaluation(
+            db_root=args.db_root,
+            task_path=args.task_path,
+            result_path=args.result_path.replace('.sqlite', f'_{scale}.sqlite'),  
+            dataset_name=args.dataset,
+            scale=scale,
+            markdown=args.markdown,
+            db_limit=args.db_limit,
+            sample_limit=args.sample_limit,
+            question_limit=args.question_limit,
+            time_sleep=time_sleep or args.time_sleep,   
+            prompt_type=args.prompt_type
+        )
 
 
 # Single question test example

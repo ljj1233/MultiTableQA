@@ -43,26 +43,80 @@
 
 ```bash
 # 默认提示模式评估
-python d:\NLP\MultiTableQA\open_model_evaluator.py \
-  --model_path D:\Models\Meta-Llama-3.1-8B-Instruct \
+python ./open_model_evaluator.py \
+  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
   --dataset qa \
   --scale 16k \
   --prompt_type default
+```
 
+```bash
 # 思维链(CoT)提示模式评估
-python d:\NLP\MultiTableQA\open_model_evaluator.py \
-  --model_path D:\Models\Meta-Llama-3.1-8B-Instruct \
+python ./open_model_evaluator.py \
+  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
   --dataset qa \
   --scale 16k \
   --prompt_type cot \
-  --result_path d:\NLP\MultiTableQA\results\qa_cot_result.json
+  --result_path ./results/qa_cot_result.json
+```
 
+```bash
 # 表格增强提示模式评估
-python d:\NLP\MultiTableQA\open_model_evaluator.py \
-  --model_path D:\Models\Meta-Llama-3.1-8B-Instruct \
+python ./open_model_evaluator.py \
+  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
   --dataset qa \
   --scale 16k \
   --prompt_type retrace_table \
   --markdown \
   --log_root d:\NLP\MultiTableQA\logs\qa_retrace
+```
+
+### 2. 使用表格问答评估器
+使用 table_qa_evaluator.py 评估模型在表格问答任务上的性能：
+
+```bash
+# 默认提示模式评估
+python ./table_qa_evaluator.py \
+  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
+  --db_root dataset/task/scaledDB \
+  --task_path dataset/task/tableQA/dataset.sqlite \
+  --result_path dataset/results/tableQA/llama3.sqlite \
+  --dataset TableQA \
+  --scale 8k \
+  --db_limit 5 \
+  --sample_limit 1 \
+  --question_limit 5
+```
+
+```bash 
+# 思维链(CoT)提示模式评估
+python ./table_qa_evaluator.py \
+  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
+  --db_root dataset/task/scaledDB \
+  --task_path dataset/task/tableQA/dataset.sqlite \
+  --result_path dataset/results/tableQA/llama3_cot.sqlite \
+  --dataset TableQA \
+  --scale 16k \
+  --prompt_type cot \
+  --db_limit 5 \
+  --sample_limit 1 \
+  --question_limit 14 \
+  --time_sleep 30
+```
+
+```bash 
+# 表格增强提示模式评估（使用Markdown格式）
+python ./table_qa_evaluator.py \
+  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
+  --db_root dataset/task/scaledDB \
+  --task_path dataset/task/TableQA/dataset.sqlite \
+  --result_path dataset/results/TableQA/llama3_retrace_md.sqlite \
+  --dataset TableQA \
+  --scale 32k \
+  --prompt_type retrace_table \
+  --markdown \
+  --db_limit 5 \
+  --sample_limit 1 \
+  --question_limit 14 \
+  --time_sleep 60
 ```
