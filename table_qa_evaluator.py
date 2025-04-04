@@ -4,7 +4,9 @@ import argparse
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig, GenerationConfig
 from MTable import apply_table_llama, apply_table_function
 from Utils.dataLoader import TaskCore
+from symbolic import dataDict
 
+from tqdm import tqdm
 class TableQAEvaluator:
     def __init__(self, model_path, device="cuda:0"):
         # 初始化 TableLlama 模型
@@ -31,7 +33,7 @@ class TableQAEvaluator:
         
         # 初始化生成配置
         self.generation_config = GenerationConfig(
-            max_length=1024,
+            max_length=512,
             num_beams=5,
             no_repeat_ngram_size=2,
             early_stopping=True,
@@ -73,7 +75,7 @@ class TableQAEvaluator:
             prompt_template = "Please carefully analyze and answer the following question:\n\n{db_str}\n\n{question}\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
         
         # 替换模板中的占位符
-        full_prompt = prompt_template.format(db_str=db_str, question=question)
+        full_prompt = prompt_template.format(question=question)
         
         # 如果有选项且模板中没有包含选项的占位符，则添加选项
         if choices_str and "{choices_str}" not in prompt_template:
@@ -83,7 +85,6 @@ class TableQAEvaluator:
         
         # 准备输入
         messages = [{"role": "user", "content": full_prompt}]
-        # print(f'full_prompt: {full_prompt}')
         prompt = self.tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
@@ -103,7 +104,7 @@ class TableQAEvaluator:
             **inputs,
             generation_config=self.generation_config,
             pad_token_id=self.tokenizer.eos_token_id,
-            max_new_tokens=1024,
+            max_new_tokens=512,
             temperature=0.7,
             top_p=0.9,
             do_sample=True,
@@ -150,9 +151,7 @@ class TableQAEvaluator:
         # 创建一个包装函数，将prompt_type传递给answer_question
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
             return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type)
-        from symbolic import dataDict
         database_list = list(dataDict.keys())
-        print(database_list)
         for dbn in tqdm(database_list, desc="database_list"):
             # 根据不同规模设置等待时间
             current_time_sleep = time_sleep
@@ -173,7 +172,6 @@ class TableQAEvaluator:
                     current_time_sleep = 40
                 else:
                     current_time_sleep = 5
-                
                 # 运行评估
                 task_core.testAll(
                     model=model_name,

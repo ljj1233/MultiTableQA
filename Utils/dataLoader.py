@@ -196,6 +196,7 @@ class TaskCore:
                     except Exception as e:
                         print(e)
                         error = str(e)
+                    print(f'res:{res} , pred: {pred} , gt:{gt}')
                     self.resultCur.execute(
                         TaskCore.inserttemplate.format(table_name=dbn),
                         (
