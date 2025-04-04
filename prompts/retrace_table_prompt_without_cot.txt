@@ -1,0 +1,8 @@
+
+Please carefully analyze the table data and answer the following question:
+
+{db_str}
+
+{question}
+
+This question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`.

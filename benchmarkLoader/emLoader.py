@@ -2,7 +2,7 @@ import sys
 import pandas as pd
 sys.path.append('.')
 from benchmarkLoader import BenchmarkDataset, singlePrompt
-from benchmarkUtils.jsTool import JS
+from Utils.jsTool import JS
 
 class EMDataset(BenchmarkDataset):
     """

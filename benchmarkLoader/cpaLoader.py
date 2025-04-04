@@ -3,7 +3,7 @@ import pandas as pd
 import sys
 sys.path.append('.')
 from benchmarkLoader import BenchmarkDataset, singlePrompt
-from benchmarkUtils.jsTool import JS
+from Utils.jsTool import JS
 
 class CPADataset(BenchmarkDataset):
     """
