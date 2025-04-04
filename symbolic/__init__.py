@@ -35,9 +35,9 @@ dataDict = {
 }
 
 choiceMap = 'A B C D E'.split()
-with open('benchmarkLoader/prompts/singleChoicePrompt.txt', 'r') as txt:
+with open('prompts/singleChoicePrompt.txt', 'r') as txt:
     singleChoicePrompt = txt.read()
-with open('benchmarkLoader/prompts/multiChoicePrompt.txt', 'r') as txt:
+with open('prompts/multiChoicePrompt.txt', 'r') as txt:
     multiChoicePrompt = txt.read()
 
 def extractAnswer(text:str)->str:
