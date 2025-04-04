@@ -75,8 +75,8 @@ class TableQAEvaluator:
             prompt_template = "Please carefully analyze and answer the following question:\n\n{db_str}\n\n{question}\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
         
         # 替换模板中的占位符
-        full_prompt = prompt_template.format(question=question)
-        
+        full_prompt = prompt_template.format(db_str=db_str,question=question)
+        print(f'full_prompt: {full_prompt}')
         # 如果有选项且模板中没有包含选项的占位符，则添加选项
         if choices_str and "{choices_str}" not in prompt_template:
             full_prompt += f"\n\n{choices_str}"

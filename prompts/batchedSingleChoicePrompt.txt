@@ -1,6 +1,6 @@
 Please carefully analyze and answer the following single choice questions step by step.
 
-{database}
+{db_str}
 
 {questions}
 

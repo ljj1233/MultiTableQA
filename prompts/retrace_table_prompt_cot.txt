@@ -2,7 +2,6 @@
 Please carefully analyze the table data and answer the following question:
 
 {db_str}
-
 {question}
 
 Let me solve this step by step:
