@@ -6,9 +6,12 @@ from tqdm import tqdm
 from datetime import datetime
 from uuid import uuid4
 import time
+import sys
+
+sys.path.append(".")
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig, GenerationConfig
-from multi_Table import apply_table_llama, apply_table_function
+from MTable import apply_table_llama, apply_table_function
 from Utils.jsTool import JS
 from eval.evaluator import evalAcc
 
@@ -46,7 +49,7 @@ class TableLlamaEvaluator:
         
         # 初始化生成配置
         self.generation_config = GenerationConfig(
-            max_length=512,
+            max_length=1024,
             num_beams=5,
             no_repeat_ngram_size=2,
             early_stopping=True,
@@ -57,9 +60,9 @@ class TableLlamaEvaluator:
         # 应用表格注入增强
         apply_table_llama(
             self.model,
-            starting_layer=5,
-            ending_layer=7,
-            entropy_threshold=0.5,
+            starting_layer=7,
+            ending_layer=712,
+            entropy_threshold=0.8,
             retracing_ratio=0.05
         )
         print(f"模型 {model_path} 已加载完成")
@@ -82,7 +85,7 @@ class TableLlamaEvaluator:
         }
         
         # 确保提示目录存在
-        os.makedirs("d:/NLP/MultiTableQA/prompts", exist_ok=True)
+        os.makedirs("./prompts", exist_ok=True)
         
         # 加载提示模板
         for prompt_type, file_path in template_files.items():
@@ -119,6 +122,7 @@ class TableLlamaEvaluator:
         
         # 准备输入
         messages = [{"role": "user", "content": full_prompt}]
+        print(f'full_prompt: {full_prompt}')
         prompt = self.tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
@@ -138,7 +142,7 @@ class TableLlamaEvaluator:
             **inputs,
             generation_config=self.generation_config,
             pad_token_id=self.tokenizer.eos_token_id,
-            max_new_tokens=512,
+            max_new_tokens=1024,
             temperature=0.7,
             top_p=0.9,
             do_sample=True,
@@ -196,47 +200,45 @@ def main():
         is_api_model=False
     )
 
-# 单个问题测试示例
+
+# Single question test example
 def test_single_question():
     model_path = "chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct"
     evaluator = TableLlamaEvaluator(model_path)
-    
-    # 多表关联的表格内容
+
+    # Table content for multi-table association
     table_content = """
-    ## employees
-    | employee_id | name  | department_id | position       | salary |
-    |-------------|-------|---------------|----------------|--------|
-    | 1           | 张三  | 101           | 高级工程师     | 25000  |
-    | 2           | 李四  | 101           | 工程师         | 18000  |
-    | 3           | 王五  | 102           | 销售经理       | 20000  |
-    | 4           | 赵六  | 102           | 销售代表       | 15000  |
-    | 5           | 钱七  | 103           | 财务主管       | 22000  |
-    
     ## departments
     | department_id | department_name | location    | manager_id |
     |---------------|----------------|-------------|------------|
-    | 101           | 研发部         | 北京        | 1          |
-    | 102           | 销售部         | 上海        | 3          |
-    | 103           | 财务部         | 广州        | 5          |
-    
+    | 101           | R & D Department | Beijing     | 1          |
+    | 102           | Sales Department | Shanghai    | 3          |
+    | 103           | Finance Department | Guangzhou  | 5          |
+
     ## projects
     | project_id | project_name | department_id | start_date  | end_date    | budget  |
     |------------|--------------|---------------|-------------|-------------|---------|
-    | 201        | 产品A开发    | 101           | 2023-01-15  | 2023-06-30  | 500000  |
-    | 202        | 市场推广     | 102           | 2023-02-01  | 2023-04-30  | 300000  |
-    | 203        | 财务系统升级 | 103           | 2023-03-10  | 2023-05-15  | 250000  |
-    | 204        | 产品B开发    | 101           | 2023-04-01  | 2023-09-30  | 600000  |
+    | 201        | Product A Development | 101           | 2023-01-15  | 2023-06-30  | 500  |
+    | 202        | Marketing Promotion | 102           | 2023-02-01  | 2023-04-30    | 300  |
+    | 203        | Finance System Upgrade | 103           | 2023-03-10  | 2023-05-15 | 250  |
+    | 204        | Product B Development | 101           | 2023-04-01  | 2023-09-30  | 600  |
     """
-    
-    # 多表关联的问题
-    question = "研发部负责了哪些项目？这些项目的总预算是多少？"
-    
-    # 测试三种不同的提问方式
+
+    # Question for multi-table association
+    # question = "What is the total budget of the projects managed by the R & D Department? Choices:\n A. 1100\nB. 670\nC. 500 \nD. 1650"
+    question = "Which project is managed by the Sales Department? Choices:\n A. Product A Development\nB. Marketing Promotion\nC. Finance System Upgrade \nD. Product B Development"
+
+
+    '''
+    正确答案
+    是C
+    '''
+
+    # Test three different question - asking methods
     for prompt_type in ["default", "cot", "retrace_table"]:
-        print(f"\n===== 提问方式: {prompt_type} =====")
+        print(f"\n===== Question - asking method: {prompt_type} =====")
         response = evaluator.answer_question(table_content, question, "", prompt_type=prompt_type)
-        print("问题:", question)
-        print("回答:", response)
+        print("Answer:", response)
 
 if __name__ == "__main__":
     # 如果直接运行此脚本，则执行单个问题测试

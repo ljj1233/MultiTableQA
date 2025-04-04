@@ -31,7 +31,7 @@ class TableQAEvaluator:
         
         # 初始化生成配置
         self.generation_config = GenerationConfig(
-            max_length=512,
+            max_length=1024,
             num_beams=5,
             no_repeat_ngram_size=2,
             early_stopping=True,
@@ -40,10 +40,10 @@ class TableQAEvaluator:
         )
         apply_table_llama(
                 self.model,
-                starting_layer=7,
+                starting_layer=8,
                 ending_layer=12,
-                entropy_threshold=0.75,
-                retracing_ratio=0.1
+                entropy_threshold=0.9,
+                retracing_ratio=0.02
             )
         print(f"模型 {model_path} 已加载完成")
 
@@ -83,6 +83,7 @@ class TableQAEvaluator:
         
         # 准备输入
         messages = [{"role": "user", "content": full_prompt}]
+        # print(f'full_prompt: {full_prompt}')
         prompt = self.tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
@@ -102,7 +103,7 @@ class TableQAEvaluator:
             **inputs,
             generation_config=self.generation_config,
             pad_token_id=self.tokenizer.eos_token_id,
-            max_new_tokens=512,
+            max_new_tokens=1024,
             temperature=0.7,
             top_p=0.9,
             do_sample=True,
@@ -269,8 +270,10 @@ def test_single_question():
     """
 
     # Question for multi-table association
-    question = "What is the total budget of the projects managed by the R & D Department? Please provide the answer in the format of \"Answer: X\" in the last line.\nA. 500\nB. 600\nC. 1100\nD. 1650"
-    
+    # question = "What is the total budget of the projects managed by the R & D Department? Choices:\n A. 1100\nB. 670\nC. 500 \nD. 1650"
+    question = "Which project is managed by the Sales Department? Choices:\n A. Product A Development\nB. Marketing Promotion\nC. Finance System Upgrade \nD. Product B Development"
+
+
     '''
     正确答案
     是C
