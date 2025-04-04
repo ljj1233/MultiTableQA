@@ -1,7 +1,8 @@
-{db_str}
 
-请仔细分析表格数据并回答以下问题：
+Please carefully analyze the table data and answer the following question:
+
+{db_str}
 
 {question}
 
-请提供详细的分析过程，并在最后给出明确的答案。如果是选择题，请在最后一行以"Answer: X"的格式给出答案，其中X是选项字母。
+This question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`.

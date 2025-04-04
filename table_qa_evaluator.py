@@ -61,26 +61,25 @@ class TableQAEvaluator:
         返回:
         - 模型的回答
         """
-        # 根据不同的提示类型构建完整的提示
-        if prompt_type == "default":
-            # 原始提问方式
-            full_prompt = f"{db_str}\n\nPlease carefully analyze and answer the following question step by step.\n\n{question}"
-            
-        elif prompt_type == "cot":
-            # 加入 CoT (Chain-of-Thought) 的提问方式
-            full_prompt = f"{db_str}\n\nPlease carefully analyze and answer the following question step by step.\n\n{question}\n\nFollow these steps:\n1. Analyze the table structure and relationships\n2. Identify the tables and fields needed to answer the question\n3. If multiple tables are involved, consider their relationships\n4. Perform necessary data operations (filtering, joining, calculating, etc.)\n5. Derive the final answer"
-            
-        elif prompt_type == "retrace_table":
-            # 针对多表关系的提问方式，配合表格增强功能
-            full_prompt = f"{db_str}\n\nPlease carefully analyze and answer the following question step by step.\n\n{question}\n\nThis is a multi-table query. First analyze the relationships between tables (such as foreign key associations), then determine which tables you need to extract information from, and finally derive the answer through table joins and data processing."
+        # 根据提示类型读取对应的prompt文件
+        prompt_file_path = os.path.join("./prompts", f"{prompt_type}_prompt.txt")
         
-        else:
-            # 默认提问方式
-            full_prompt = f"{db_str}\n\nPlease carefully analyze and answer the following question step by step.\n\n{question}"
+        try:
+            with open(prompt_file_path, 'r', encoding='utf-8') as f:
+                prompt_template = f.read()
+        except FileNotFoundError:
+            print(f"警告: 未找到提示文件 {prompt_file_path}，使用默认提示")
+            # 如果找不到文件，使用默认提示
+            prompt_template = "Please carefully analyze and answer the following question:\n\n{db_str}\n\n{question}\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
         
-        # 如果有选项，添加到提示中
-        if choices_str:
-            full_prompt += f"\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect.\n\n{choices_str}\n\nConclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
+        # 替换模板中的占位符
+        full_prompt = prompt_template.format(db_str=db_str, question=question)
+        
+        # 如果有选项且模板中没有包含选项的占位符，则添加选项
+        if choices_str and "{choices_str}" not in prompt_template:
+            full_prompt += f"\n\n{choices_str}"
+        elif choices_str:
+            full_prompt = full_prompt.replace("{choices_str}", choices_str)
         
         # 准备输入
         messages = [{"role": "user", "content": full_prompt}]
@@ -219,15 +218,6 @@ def test_single_question():
 
     # Table content for multi-table association
     table_content = """
-    ## employees
-    | employee_id | name  | department_id | position       | salary |
-    |-------------|-------|---------------|----------------|--------|
-    | 1           | Zhang San | 101           | Senior Engineer | 25000  |
-    | 2           | Li Si   | 101           | Engineer       | 18000  |
-    | 3           | Wang Wu | 102           | Sales Manager  | 20000  |
-    | 4           | Zhao Liu| 102           | Sales Representative | 15000  |
-    | 5           | Qian Qi | 103           | Finance Supervisor | 22000  |
-
     ## departments
     | department_id | department_name | location    | manager_id |
     |---------------|----------------|-------------|------------|
@@ -246,16 +236,16 @@ def test_single_question():
 
     # Question for multi-table association
     question = "What is the total budget of the projects managed by the R & D Department? Please provide the answer in the format of \"Answer: X\" in the last line.\nA. 500\nB. 600\nC. 1100\nD. 1650"
+    
     '''
     正确答案
-    这些项目的总预算是 1100000
+    是C
     '''
 
     # Test three different question - asking methods
     for prompt_type in ["default", "cot", "retrace_table"]:
         print(f"\n===== Question - asking method: {prompt_type} =====")
         response = evaluator.answer_question(table_content, question, "", prompt_type=prompt_type)
-        # print("Question:", question)
         print("Answer:", response)
 
 if __name__ == "__main__":
