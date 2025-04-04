@@ -78,7 +78,7 @@ python ./open_model_evaluator.py \
 # 默认提示模式评估
 python ./table_qa_evaluator.py \
   --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
-  --db_root dataset/task/scaledDB \
+  --db_root dataset/task/scaledDB  \
   --task_path dataset/task/tableQA/dataset.sqlite \
   --result_path dataset/results/tableQA/llama3.sqlite \
   --dataset TableQA \

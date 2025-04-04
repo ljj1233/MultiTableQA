@@ -153,7 +153,7 @@ class TableQAEvaluator:
         # 运行评估
         task_core.testAll(
             model=model_name,
-            dbn=dataset_name,
+            dbn=db_root,
             scale=scale,
             markdown=markdown,
             dbLimit=db_limit,
