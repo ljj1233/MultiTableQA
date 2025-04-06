@@ -8,11 +8,13 @@ from symbolic import dataDict
 
 from tqdm import tqdm
 class TableQAEvaluator:
-    def __init__(self, model_path, device="cuda:0", multi_gpu=False):
+    def __init__(self, model_path, device="cuda:0", multi_gpu=False, use_llm_for_relevance=False):
         # 初始化 TableLlama 模型
         self.device = device
         self.multi_gpu = multi_gpu
-
+        self.use_llm_for_relevance = use_llm_for_relevance
+        self.table_token_budget = 1024  # 设置表格token预算
+        
         apply_table_function()
 
         # 加载模型配置
@@ -58,7 +60,88 @@ class TableQAEvaluator:
                 retracing_ratio=0.02
             )
         print(f"模型 {model_path} 已加载完成")
-    
+    def _get_relevant_rows_with_llm(self, df, table_name, question, max_rows=5):
+        """
+        使用LLM来确定表格中与问题相关的行
+        
+        参数:
+        - df: 表格数据（DataFrame）
+        - table_name: 表格名称
+        - question: 问题文本
+        - max_rows: 最大返回行数
+        
+        返回:
+        - 相关行的索引列表
+        """
+        # 准备提示模板
+        prompt = f"""Analyze the following question and table, and identify the most relevant row indices (maximum {max_rows} rows).
+        
+        Question: {question}
+
+        Table Name: {table_name}
+        Table Structure:
+        {df.columns.tolist()}
+
+        Table Content (first 10 rows or all):
+        {df.head(10).to_string(index=True)}
+
+        Please return only the relevant row indices (e.g., 0,1,3), without any other text. If there are no relevant rows, return "No relevant rows"."""
+
+        simple_gen_config = GenerationConfig(
+            max_new_tokens=50,
+            temperature=0.1,
+            top_p=0.9,
+            do_sample=False
+        )
+        
+        # 准备输入
+        messages = [{"role": "user", "content": prompt}]
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        inputs = self.tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=2048  # 使用较小的长度限制
+        ).to(self.device)
+        
+        # 生成回答
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                generation_config=simple_gen_config,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        
+        # 解码回答
+        output_text = self.tokenizer.decode(
+            outputs[0][inputs.input_ids.shape[1]:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        ).strip()
+        
+        # 解析回答中的索引
+        if "No relevant rows" in output_text:
+            return []
+        
+        try:
+            # 尝试从回答中提取数字
+            indices = []
+            for token in re.findall(r'\d+', output_text):
+                idx = int(token)
+                if idx in df.index:
+                    indices.append(idx)
+            
+            # 限制返回行数
+            return indices[:max_rows]
+        except Exception as e:
+            print(f"警告: 解析LLM返回的行索引时出错: {e}")
+            return [] 
 
     def _load_prompt_templates(self,prompt_type="default"):
         """
@@ -264,6 +347,9 @@ class TableQAEvaluator:
         compact_table_parts = []
         question_keywords = set(question.lower().split())
         rows_to_keep_per_table = 5  # 限制备选/非相关表格的行数
+        
+        # 确定使用的相关性筛选方法
+        use_llm_filtering = hasattr(self, 'use_llm_for_relevance') and self.use_llm_for_relevance
 
         for table_info in parsed_tables:
             table_name = table_info['name']
@@ -276,22 +362,38 @@ class TableQAEvaluator:
             schema_str = "模式: " + " | ".join(df.columns.astype(str))
             compact_table_parts.append(schema_str)
 
-            # 基于简单关键词匹配找出相关行
+            # 基于LLM或关键词匹配找出相关行
             relevant_indices = []
-            for index, row in df.iterrows():
+            
+            if use_llm_filtering:
+                # 方法1: 使用LLM进行相关行提取
                 try:
-                   row_text = ' '.join(map(str, row.fillna('').values)).lower()  # 处理NaN
-                   if any(keyword in row_text for keyword in question_keywords):
-                       relevant_indices.append(index)
-                except Exception:  # 捕获字符串转换过程中的潜在错误
-                    continue  # 如果转换失败则跳过该行
+                    relevant_indices = self._get_relevant_rows_with_llm(df, table_name, question)
+                    if relevant_indices:
+                        print(f"信息: 使用LLM在表'{table_name}'中找到了{len(relevant_indices)}个相关行。")
+                except Exception as e:
+                    print(f"警告: LLM相关性筛选失败: {e}，将回退到关键词匹配。")
+                    use_llm_filtering = False  # 本次失败后回退到关键词匹配
+            
+            # 方法2: 如果LLM方法未启用或失败，使用关键词匹配
+            if not use_llm_filtering or not relevant_indices:
+                for index, row in df.iterrows():
+                    try:
+                        row_text = ' '.join(map(str, row.fillna('').values)).lower()  # 处理NaN
+                        if any(keyword in row_text for keyword in question_keywords):
+                            relevant_indices.append(index)
+                    except Exception:  # 捕获字符串转换过程中的潜在错误
+                        continue  # 如果转换失败则跳过该行
+                    
+                    if relevant_indices and not use_llm_filtering:
+                        print(f"信息: 使用关键词匹配在表'{table_name}'中找到了{len(relevant_indices)}个相关行。")
 
             selected_indices = relevant_indices
             if not relevant_indices:
                 # 备选方案：如果没有找到相关行，保留前N行
                 selected_indices = df.head(rows_to_keep_per_table).index.tolist()
                 if len(selected_indices) > 0:
-                   print(f"信息: 在表'{table_name}'中未找到基于关键词的相关行。使用前{len(selected_indices)}行。")
+                    print(f"信息: 在表'{table_name}'中未找到相关行。使用前{len(selected_indices)}行。")
 
             # 线性化选定的行
             rows_added = 0
@@ -435,11 +537,18 @@ def main():
                         help="提示类型: default(原始提问), cot(思维链), retrace_table(表格增强)")
     parser.add_argument("--device", type=str, default="cuda:0", help="指定使用的设备，例如 'cuda:0'")
     parser.add_argument("--multi_gpu", action="store_true", help="是否使用多GPU并行计算")
+    parser.add_argument("--use_llm_relevance", action="store_true", 
+                        help="使用LLM进行表格相关性筛选（可能会增加处理时间）")
     
     args = parser.parse_args()
     
     # 初始化评估器，传入设备和多GPU参数
-    evaluator = TableQAEvaluator(args.model_path, device=args.device, multi_gpu=args.multi_gpu)
+    evaluator = TableQAEvaluator(
+        args.model_path, 
+        device=args.device, 
+        multi_gpu=args.multi_gpu,
+        use_llm_for_relevance=args.use_llm_relevance
+    )
     
     # 如果不使用表格增强功能，则禁用它
     if args.prompt_type != "retrace_table":
@@ -513,6 +622,9 @@ def test_single_question():
         print(f"\n===== Question - asking method: {prompt_type} =====")
         response = evaluator.answer_question(table_content, question, "", prompt_type=prompt_type)
         print("Answer:", response)
+
+
+
 
 if __name__ == "__main__":
     # If this script is run directly, execute the single question test
