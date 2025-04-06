@@ -13,7 +13,7 @@ class TableQAEvaluator:
         self.device = device
         self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 1024  # 设置表格token预算
+        self.table_token_budget = 2048  # 增加token预算以处理更多表格数据
         
         apply_table_function()
 
@@ -60,88 +60,7 @@ class TableQAEvaluator:
                 retracing_ratio=0.02
             )
         print(f"模型 {model_path} 已加载完成")
-    def _get_relevant_rows_with_llm(self, df, table_name, question, max_rows=5):
-        """
-        使用LLM来确定表格中与问题相关的行
-        
-        参数:
-        - df: 表格数据（DataFrame）
-        - table_name: 表格名称
-        - question: 问题文本
-        - max_rows: 最大返回行数
-        
-        返回:
-        - 相关行的索引列表
-        """
-        # 准备提示模板
-        prompt = f"""Analyze the following question and table, and identify the most relevant row indices (maximum {max_rows} rows).
-        
-        Question: {question}
-
-        Table Name: {table_name}
-        Table Structure:
-        {df.columns.tolist()}
-
-        Table Content (first 10 rows or all):
-        {df.head(10).to_string(index=True)}
-
-        Please return only the relevant row indices (e.g., 0,1,3), without any other text. If there are no relevant rows, return "No relevant rows"."""
-
-        simple_gen_config = GenerationConfig(
-            max_new_tokens=50,
-            temperature=0.1,
-            top_p=0.9,
-            do_sample=False
-        )
-        
-        # 准备输入
-        messages = [{"role": "user", "content": prompt}]
-        prompt_text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        inputs = self.tokenizer(
-            prompt_text,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048  # 使用较小的长度限制
-        ).to(self.device)
-        
-        # 生成回答
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                generation_config=simple_gen_config,
-                pad_token_id=self.tokenizer.eos_token_id
-            )
-        
-        # 解码回答
-        output_text = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        ).strip()
-        
-        # 解析回答中的索引
-        if "No relevant rows" in output_text:
-            return []
-        
-        try:
-            # 尝试从回答中提取数字
-            indices = []
-            for token in re.findall(r'\d+', output_text):
-                idx = int(token)
-                if idx in df.index:
-                    indices.append(idx)
-            
-            # 限制返回行数
-            return indices[:max_rows]
-        except Exception as e:
-            print(f"警告: 解析LLM返回的行索引时出错: {e}")
-            return [] 
+  
 
     def _load_prompt_templates(self,prompt_type="default"):
         """
@@ -226,6 +145,206 @@ class TableQAEvaluator:
             
         print(f"评估完成，结果已保存到 {result_path}")
 
+
+    def _get_relevant_rows_with_llm(self, df, table_name, question, max_rows=15):
+        """
+        使用LLM来确定表格中与问题相关的行索引
+        
+        参数:
+            df (pd.DataFrame): 表格数据
+            table_name (str): 表格名称
+            question (str): 问题文本
+            max_rows (int): 返回的最大相关行索引数量
+            
+        返回:
+            List[int]: 相关行索引列表，数量不超过max_rows
+        """
+        if df.empty:
+            return []
+
+        # --- 优化的提示模板 ---
+        prompt = f"""Your task is to identify the most relevant row indices from the table below to answer the given question.
+
+        Question: {question}
+
+        Table Name: {table_name}
+        Total Rows in Original Table: {len(df)}
+        Table Schema (Columns): {df.columns.tolist()}
+
+        Table Content Sample (up to 20 rows shown):
+        {df.head(20).to_string(index=True)}
+
+        Instructions:
+        1. Analyze the Question and the Table Schema/Content.
+        2. Identify rows containing information (direct or indirect) crucial for answering the question.
+        3. If the table content sample seems incomplete (due to the 20-row limit), use the schema and sample to infer potential relevance in unseen rows, but prioritize rows shown.
+        4. Return ONLY a comma-separated list of relevant row indices (integers). Example: 0,5,12,28
+        5. If no rows seem relevant, return the exact text: No relevant rows
+
+        Relevant row indices:"""
+
+        # --- 生成配置 ---
+        # 选项1: 更确定性的生成（通常更适合提取任务）
+        simple_gen_config = GenerationConfig(
+            max_new_tokens=150,  # 允许更多的token以确保安全
+            do_sample=False,     # 使用贪婪解码或束搜索（如果模型支持）
+            num_beams=3,         # 束搜索示例
+            early_stopping=True, # 如果达到EOS则提前停止
+            temperature=None,    # 对于do_sample=False不需要
+            top_p=None           # 对于do_sample=False不需要
+        )
+        # 选项2: 受控采样（如果之前的设置效果良好，可以保留）
+        # simple_gen_config = GenerationConfig(
+        #     max_new_tokens=150,
+        #     temperature=0.3, # 如果采样，温度略高
+        #     top_p=0.9,       # 略微收紧top_p
+        #     do_sample=True
+        # )
+
+        # --- 输入准备 ---
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        except Exception as e:
+            print(f"应用聊天模板时出错: {e}。回退到原始提示。")
+            prompt_text = prompt # 模板失败时的回退方案
+
+        # --- 输入标记化和长度计算 ---
+        # 为输入标记计算更动态的max_length
+        # 为生成配置的max_new_tokens和缓冲区预留空间
+        model_max_len = getattr(self.model.config, 'max_position_embeddings', 4096) # 获取模型的最大长度
+        reserved_space = simple_gen_config.max_new_tokens + 50 # 为输出和缓冲区预留空间
+        input_max_len = model_max_len - reserved_space
+        if input_max_len <= 0:
+             print(f"警告: 模型最大长度({model_max_len})对于预留空间({reserved_space})来说太小。进行调整。")
+             input_max_len = model_max_len // 2 # 或其他启发式方法
+
+        inputs = self.tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            padding=True,        # 如果有多个提示（这里没有），则填充到批次的最大长度
+            truncation=True,     # 如果超过input_max_len则截断
+            max_length=input_max_len # 使用计算的最大长度
+        ).to(self.device)
+
+        # 检查是否过度截断
+        if inputs.input_ids.shape[1] >= input_max_len:
+             print(f"警告: 表'{table_name}'的LLM过滤提示被截断至{input_max_len}个tokens。上下文可能丢失。")
+
+        # --- LLM生成 ---
+        relevant_indices = []
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    generation_config=simple_gen_config,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+
+            # --- 输出解码和解析 ---
+            # 仅解码生成的部分
+            output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
+            output_text = self.tokenizer.decode(
+                output_token_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            ).strip()
+
+            # print(f"调试: 表'{table_name}'的LLM相关性输出: {output_text}") # 调试打印
+
+            if "no relevant rows" in output_text.lower(): # 不区分大小写检查
+                return []
+
+            # 使用正则表达式提取索引，转换为int，验证是否在df.index中
+            extracted_indices = set() # 使用集合处理LLM输出中的重复项
+            for token in re.findall(r'\d+', output_text):
+                try:
+                    idx = int(token)
+                    if idx in df.index: # 检查索引对于*原始*df是否有效
+                        extracted_indices.add(idx)
+                except ValueError:
+                    continue # 忽略非整数标记
+
+            # 将集合转回列表并排序以保持一致性（可选）
+            relevant_indices = sorted(list(extracted_indices))
+
+            # 限制为max_rows
+            return relevant_indices[:max_rows]
+
+        except Exception as e:
+            print(f"警告: 表'{table_name}'的LLM相关性生成或解析过程中出错: {e}")
+            return [] # 出错时返回空列表
+
+
+    def _get_relevant_columns(self, df, question_keywords, include_ids=True):
+        """
+        Identifies relevant columns based on keyword matching with column names.
+        Optionally always includes likely ID/Name columns.
+
+        Args:
+            df (pd.DataFrame): The table data.
+            question_keywords (set): Set of lowercase keywords from the question.
+            include_ids (bool): Whether to always include potential ID/Name columns.
+
+        Returns:
+            List[str]: A list of relevant column names.
+        """
+        relevant_cols = set()
+        potential_id_cols = set()
+
+        if df.empty:
+            return []
+
+        for col in df.columns:
+            col_lower = str(col).lower() # Ensure column name is string and lowercased
+
+            # Basic check if column seems like an ID/Name (heuristic)
+            if include_ids and ('id' in col_lower or 'key' in col_lower or 'name' in col_lower or 'identifier' in col_lower or 'code' in col_lower):
+                 potential_id_cols.add(col)
+
+            # Check if column name itself is relevant
+            # Split column name in case it's multi-word (e.g., "department_name")
+            col_name_parts = set(re.split(r'[_\s-]+', col_lower))
+            if question_keywords.intersection(col_name_parts):
+                 relevant_cols.add(col)
+
+            # Optional: Check content (can be slow, use cautiously)
+            # Consider adding a flag to enable/disable this
+            # if df[col].dtype == 'object':
+            #     try:
+            #         # Check a sample for performance
+            #         sample_size = min(len(df), 50)
+            #         if any(df[col].head(sample_size).str.contains(keyword, case=False, na=False).any() for keyword in question_keywords):
+            #              relevant_cols.add(col)
+            #     except Exception:
+            #         pass
+
+        # Combine relevant columns and potential ID columns
+        final_relevant_cols = relevant_cols.union(potential_id_cols if include_ids else set())
+
+
+        # Fallback: If no columns identified, use potential IDs or just the first column
+        if not final_relevant_cols:
+            if potential_id_cols:
+                 final_relevant_cols = potential_id_cols
+            elif len(df.columns) > 0:
+                 final_relevant_cols = {df.columns[0]} # Fallback to first column
+
+        # Return in original order, ensuring at least one column if possible
+        ordered_final_cols = [col for col in df.columns if col in final_relevant_cols]
+
+        if not ordered_final_cols and len(df.columns) > 0:
+             return [df.columns[0]] # Absolute fallback: first column
+        elif not ordered_final_cols:
+             return [] # No columns in df
+        else:
+             return ordered_final_cols
+
+
     def _parse_markdown_table(self, table_lines):
         """Attempts to parse a simple Markdown table."""
         header = []
@@ -265,91 +384,87 @@ class TableQAEvaluator:
                 return None
         return None
 
-    def process_table_content(self, db_str, question):
+    def process_table_content(self, db_str, question, use_llm_for_relevance=False): # Added use_llm_for_relevance flag
         """
-        解析多表格Markdown/CSV字符串，提取模式和相关行，
-        线性化处理，并在预算范围内进行标记化。
+        Parses multi-table Markdown/CSV, extracts relevant schema & rows (with column filtering),
+        linearizes, and tokenizes within budget.
 
-        参数:
-        - db_str: 数据库表格字符串表示（Markdown或CSV格式）
-        - question: 用于相关性过滤的问题文本
+        Args:
+            db_str (str): Database table(s) string representation.
+            question (str): The question text.
+            use_llm_for_relevance (bool): Flag to enable LLM-based row filtering.
 
-        返回:
-        - 处理后的表格token IDs (torch.Tensor)，如果处理失败则返回None
+        Returns:
+            torch.Tensor or None: Processed table token IDs or None on failure.
         """
-        max_tokens = self.table_token_budget  # 使用__init__中定义的token预算
+        max_tokens = self.table_token_budget
         parsed_tables = []
-
-        # --- 1. 尝试解析多表格Markdown（使用##表头） ---
-        # 按'## table_name'表头分割，保留表头
+        # --- Parsing Logic (Sections 1, 2, 3 - remains mostly the same) ---
+        # ... (Keep the robust parsing logic for ## headers, Markdown, and CSV fallback) ...
+        # Split by '## table_name' headers, keeping the headers
         table_sections = re.split(r'(^##\s+\w+\s*?$)', db_str, flags=re.MULTILINE)
-
         current_table_name = "default_table"
         content_buffer = []
-
-        if len(table_sections) <= 1:  # 没有找到'##'表头，作为单个块处理
+        if len(table_sections) <= 1:
              content_buffer = db_str.strip().split('\n')
-             table_sections = []  # 清空sections以避免下面的处理
+             table_sections = []
         else:
-            # 遍历各部分，配对表头和内容
             for section in table_sections:
                 section = section.strip()
-                if not section:
-                    continue
+                if not section: continue
                 if section.startswith("##"):
-                    # 如果我们有*前一个*表的缓冲内容，处理它
                     if content_buffer:
                         df = self._parse_markdown_table(content_buffer)
                         if df is not None:
                              parsed_tables.append({"name": current_table_name, "df": df})
-                        else:
-                             print(f"警告: 无法将表'{current_table_name}'下的内容解析为Markdown格式。")
-                             # 可以选择在这里对该块尝试CSV解析
-                        content_buffer = []  # 重置缓冲区
+                        else: # Try CSV if Markdown failed
+                            try:
+                                delimiter = ',' if any(',' in line for line in content_buffer[:5]) else ('|' if any('|' in line for line in content_buffer[:5]) else '\t')
+                                csv_like_string = "\n".join(line for line in content_buffer if line.strip()) # Skip empty lines
+                                df_csv = pd.read_csv(StringIO(csv_like_string), sep=delimiter, skipinitialspace=True, quotechar='"', on_bad_lines='skip')
+                                if not df_csv.empty:
+                                     df_csv = df_csv.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+                                     parsed_tables.append({"name": current_table_name, "df": df_csv})
+                                     print(f"Info: Parsed block under '{current_table_name}' as CSV (delimiter '{delimiter}').")
+                                else:
+                                     print(f"Warning: Failed to parse content under table '{current_table_name}' as Markdown or CSV.")
+                            except Exception as e_csv:
+                                print(f"Warning: Failed parsing content under '{current_table_name}' as Markdown or CSV: {e_csv}")
+                        content_buffer = []
                     current_table_name = section.lstrip('#').strip()
                 else:
-                    # 将内容行添加到当前表的缓冲区
                     content_buffer.extend(section.split('\n'))
-
-        # 处理缓冲区中的剩余内容（最后一个表或单个块）
+        # Process last block
         if content_buffer:
              df = self._parse_markdown_table(content_buffer)
              if df is not None:
                  parsed_tables.append({"name": current_table_name, "df": df})
-             else:
-                 # --- 2. 备选方案：尝试将整个块解析为CSV ---
-                 print(f"信息: '{current_table_name}'下的Markdown解析失败。尝试CSV解析。")
+             else: # Try CSV
                  try:
-                     # 尝试常见分隔符，注意错误处理
-                     delimiter = ',' if ',' in content_buffer[0] else ('|' if '|' in content_buffer[0] else '\t')
-                     csv_like_string = "\n".join(content_buffer)
-                     df = pd.read_csv(StringIO(csv_like_string), sep=delimiter, skipinitialspace=True)
-                     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)  # 清理空白
-                     parsed_tables.append({"name": current_table_name, "df": df})
-                     print(f"信息: 成功将'{current_table_name}'下的内容解析为CSV格式，使用分隔符'{delimiter}'。")
-                 except Exception as e:
-                     print(f"警告: 无法将'{current_table_name}'下的内容解析为Markdown或CSV格式: {e}")
+                     delimiter = ',' if any(',' in line for line in content_buffer[:5]) else ('|' if any('|' in line for line in content_buffer[:5]) else '\t')
+                     csv_like_string = "\n".join(line for line in content_buffer if line.strip())
+                     df_csv = pd.read_csv(StringIO(csv_like_string), sep=delimiter, skipinitialspace=True, quotechar='"', on_bad_lines='skip')
+                     if not df_csv.empty:
+                          df_csv = df_csv.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+                          parsed_tables.append({"name": current_table_name, "df": df_csv})
+                          print(f"Info: Parsed last block '{current_table_name}' as CSV (delimiter '{delimiter}').")
+                     else:
+                          print(f"Warning: Failed to parse last block under '{current_table_name}' as Markdown or CSV.")
+                 except Exception as e_csv:
+                     print(f"Warning: Failed parsing last block under '{current_table_name}' as Markdown or CSV: {e_csv}")
 
-
-        # --- 3. 备选方案：如果没有成功解析任何表格 ---
+        # Fallback if nothing parsed
         if not parsed_tables:
-            print("警告: 无法从db_str解析任何结构化表格。使用原始字符串（截断）。")
-            # 截断原始字符串并标记化
-            encoded = self.tokenizer.encode(db_str)
-            if len(encoded) > max_tokens:
-                truncated_str = self.tokenizer.decode(encoded[:max_tokens], skip_special_tokens=True)
-                print(f"警告: 原始表格字符串被截断至约{max_tokens}个tokens。")
-            else:
-                truncated_str = db_str
-            return self.tokenizer(truncated_str, return_tensors='pt').input_ids
+            print("Warning: Could not parse any structured tables from db_str. Using raw string (truncated).")
+            encoded = self.tokenizer.encode(db_str, max_length=max_tokens, truncation=True)
+            # Decode only if needed, return tensor directly
+            return torch.tensor([encoded], device=self.device) # Return tensor directly
 
-        # --- 4. 线性化解析后的表格并进行相关性过滤 ---
+
+        # --- 4. Linearization with Column and Row Filtering ---
         compact_table_parts = []
         question_keywords = set(question.lower().split())
-        rows_to_keep_per_table = 5  # 限制备选/非相关表格的行数
-        
-        # 确定使用的相关性筛选方法
-        use_llm_filtering = hasattr(self, 'use_llm_for_relevance') and self.use_llm_for_relevance
+        rows_to_keep_per_table_fallback = 5 # Reduced fallback row count
 
         for table_info in parsed_tables:
             table_name = table_info['name']
@@ -358,50 +473,63 @@ class TableQAEvaluator:
             if df.empty:
                 continue
 
+            # --- Step 4a: Filter Columns ---
+            selected_columns = self._get_relevant_columns(df, question_keywords)
+            if not selected_columns:
+                 print(f"Warning: No relevant columns identified for table '{table_name}'. Skipping table.")
+                 continue # Skip table if no columns are relevant
+
             compact_table_parts.append(f"表格: {table_name}")
-            schema_str = "模式: " + " | ".join(df.columns.astype(str))
+            # Use selected columns for schema
+            schema_str = "模式: " + " | ".join(map(str,selected_columns))
             compact_table_parts.append(schema_str)
 
-            # 基于LLM或关键词匹配找出相关行
+            # --- Step 4b: Filter Rows (using LLM or Keywords) ---
             relevant_indices = []
-            
-            if use_llm_filtering:
-                # 方法1: 使用LLM进行相关行提取
+            if use_llm_for_relevance:
+                # LLM Filtering (use the refined _get_relevant_rows_with_llm)
+                # Decide if pre-filtering is needed based on df size before calling LLM
+                # Simplified: Call LLM directly for now, assuming _get handles samples
                 try:
                     relevant_indices = self._get_relevant_rows_with_llm(df, table_name, question)
                     if relevant_indices:
-                        print(f"信息: 使用LLM在表'{table_name}'中找到了{len(relevant_indices)}个相关行。")
+                       print(f"信息: 使用LLM在表'{table_name}'中找到了{len(relevant_indices)}个相关行。")
                 except Exception as e:
                     print(f"警告: LLM相关性筛选失败: {e}，将回退到关键词匹配。")
-                    use_llm_filtering = False  # 本次失败后回退到关键词匹配
-            
-            # 方法2: 如果LLM方法未启用或失败，使用关键词匹配
-            if not use_llm_filtering or not relevant_indices:
+                    # Fallback handled below
+
+            # Keyword Filtering (if LLM not used, failed, or returned empty)
+            if not relevant_indices:
+                keyword_indices = []
                 for index, row in df.iterrows():
                     try:
-                        row_text = ' '.join(map(str, row.fillna('').values)).lower()  # 处理NaN
-                        if any(keyword in row_text for keyword in question_keywords):
-                            relevant_indices.append(index)
-                    except Exception:  # 捕获字符串转换过程中的潜在错误
-                        continue  # 如果转换失败则跳过该行
-                    
-                    if relevant_indices and not use_llm_filtering:
-                        print(f"信息: 使用关键词匹配在表'{table_name}'中找到了{len(relevant_indices)}个相关行。")
+                        # Search for keywords only within the selected columns for efficiency
+                        row_text_filtered_cols = ' '.join(map(str, row[selected_columns].fillna('').values)).lower()
+                        if any(keyword in row_text_filtered_cols for keyword in question_keywords):
+                            keyword_indices.append(index)
+                    except Exception:
+                        continue
+                relevant_indices = keyword_indices # Use keyword results
+                if relevant_indices and not use_llm_for_relevance: # Print only if keywords were the primary method
+                     print(f"信息: 使用关键词匹配在表'{table_name}'（相关列）中找到了{len(relevant_indices)}个相关行。")
+
 
             selected_indices = relevant_indices
             if not relevant_indices:
-                # 备选方案：如果没有找到相关行，保留前N行
-                selected_indices = df.head(rows_to_keep_per_table).index.tolist()
-                if len(selected_indices) > 0:
+                # Fallback: Keep top N rows if no relevant rows found
+                selected_indices = df.head(rows_to_keep_per_table_fallback).index.tolist()
+                if selected_indices:
                     print(f"信息: 在表'{table_name}'中未找到相关行。使用前{len(selected_indices)}行。")
 
-            # 线性化选定的行
+            # --- Step 4c: Linearize Selected Rows and Columns ---
             rows_added = 0
-            for index in selected_indices:
+            # Limit the number of rows actually linearized to avoid excessive length even if many are relevant
+            MAX_ROWS_TO_LINEARIZE = 30 # Example limit
+            for index in selected_indices[:MAX_ROWS_TO_LINEARIZE]:
                  try:
-                     row = df.loc[index]
-                     # 确保一致的字符串转换，处理潜在的NaN
-                     row_values_str = [str(v) if pd.notna(v) else '' for v in row.values]
+                     # Select only the relevant columns for the specific row
+                     row_data = df.loc[index, selected_columns]
+                     row_values_str = [str(v) if pd.notna(v) else '' for v in row_data.values]
                      row_str = f"行 {index}: {' | '.join(row_values_str)}"
                      compact_table_parts.append(row_str)
                      rows_added += 1
@@ -410,37 +538,30 @@ class TableQAEvaluator:
                  except Exception as e:
                      print(f"警告: 线性化表'{table_name}'的行{index}时出错: {e}")
 
-
-            if rows_added == 0 and len(selected_indices) > 0:
+            if rows_added == 0 and selected_indices:
                  print(f"Warning: Failed to linearize any selected rows for table '{table_name}'.")
 
+            compact_table_parts.append("---") # Separator
 
-            compact_table_parts.append("---") # Separator between tables
-
-        # --- 5. Tokenize the Compact Representation ---
-        compact_table_str = "\n".join(compact_table_parts).strip().rstrip('---').strip() # Remove trailing separator
-
+        # --- 5. Tokenization (Remains the same) ---
+        compact_table_str = "\n".join(compact_table_parts).strip().rstrip('---').strip()
         if not compact_table_str:
              print("Warning: Generated compact table string is empty. Returning None.")
-             return None # Or handle as appropriate
-
-        #print(f"--- Compact Table String for Tokenization ---\n{compact_table_str}\n------------------------------------------") # Debug print
-
+             return None
+        # print(f"--- Compact Table String (Cols+Rows Filtered) ---\n{compact_table_str}\n------------------------------------------") # Debug
         table_token_ids = self.tokenizer(
             compact_table_str,
             return_tensors='pt',
             max_length=max_tokens,
             truncation=True,
-            add_special_tokens=False # Usually False for context segments like tables
+            add_special_tokens=False
         ).input_ids
-
-        # Check if truncation happened
         if table_token_ids.shape[1] >= max_tokens:
-            print(f"Warning: Processed table content was truncated to {max_tokens} tokens.")
-
-        # print(f"--- Generated Table Token IDs ---\n{table_token_ids}\nShape: {table_token_ids.shape}\n--------------------------------") # Debug print
+            print(f"Warning: Final processed table content was truncated to {max_tokens} tokens.")
+        # print(f"--- Final Table Token IDs ---\n{table_token_ids}\nShape: {table_token_ids.shape}\n--------------------------------") # Debug
         return table_token_ids
-
+    
+    
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
         """
         回答问题 (Modified to pass question to process_table_content)
