@@ -43,7 +43,7 @@ class TableQAEvaluator:
         
         # 初始化生成配置
         self.generation_config = GenerationConfig(
-            max_length=512,
+            max_length=800,
             num_beams=5,
             no_repeat_ngram_size=2,
             early_stopping=True,
@@ -59,21 +59,7 @@ class TableQAEvaluator:
             )
         print(f"模型 {model_path} 已加载完成")
     
-    def process_table_content(self, db_str):
-        """
-        处理表格内容，将其转换为模型可用的格式
-        
-        参数:
-        - db_str: 数据库表格的字符串表示
-        
-        返回:
-        - 处理后的表格特征（当前实现为token IDs）
-        """
-        # 当前实现：直接将表格文本转换为token IDs
-        # 后续可以在这里实现更复杂的表格特征提取逻辑
-        table_token_ids = self.tokenizer(db_str, return_tensors='pt').input_ids
-        return table_token_ids
-    
+
     def _load_prompt_templates(self,prompt_type="default"):
         """
         加载提示模板
@@ -93,75 +79,6 @@ class TableQAEvaluator:
         
         return prompt_template
 
-    def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
-        """
-        回答问题
-        
-        参数:
-        - db_str: 数据库表格的字符串表示
-        - question: 问题文本
-        - choices_str: 选项字符串
-        - meta_info: 元信息(可选)
-        - prompt_type: 提示类型，可选值为 "default", "cot", "retrace_table"
-        
-        返回:
-        - 模型的回答
-        """
-        prompt_template = self._load_prompt_templates(prompt_type)
-        # 替换模板中的占位符
-        full_prompt = prompt_template.format(db_str=db_str,question=question)
-        print(f'full_prompt: {full_prompt}')
-        # 如果有选项且模板中没有包含选项的占位符，则添加选项
-        if choices_str and "{choices_str}" not in prompt_template:
-            full_prompt += f"\n\n{choices_str}"
-        elif choices_str:
-            full_prompt = full_prompt.replace("{choices_str}", choices_str)
-        
-        # 准备输入
-        messages = [{"role": "user", "content": full_prompt}]
-        prompt = self.tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True
-        )
-        
-        inputs = self.tokenizer(
-            prompt, 
-            return_tensors="pt",
-            padding=True,  
-            truncation=True
-        ).to(self.device)
-
-        # 生成回答
-        use_table_token = prompt_type == "retrace_table"  # 只在 retrace_table 模式下传入表格内容
-        
-        # 使用封装的函数处理表格内容
-        table_token_ids = self.process_table_content(db_str) if use_table_token else None
-        
-        outputs = self.model.generate(
-            **inputs,
-            generation_config=self.generation_config,
-            pad_token_id=self.tokenizer.eos_token_id,
-            max_new_tokens=800,
-            temperature=0.85,
-            top_p=0.8,
-            do_sample=True,
-            repetition_penalty=1.0,
-            table_token=table_token_ids ,  # 只在特定模式下传入表格内容
-            tokenizer=self.tokenizer if use_table_token else None
-        )
-
-        # 解码回答
-        response = self.tokenizer.decode(
-            outputs[0], 
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )
-        # 提取用户提示之后的部分作为回答
-        if "assistant" in response.lower():
-            response = response.split("assistant", 1)[1].strip()
-        
-        return response
 
     def run_evaluation(self, db_root, task_path, result_path, 
                       dataset_name, scale, markdown=True, 
@@ -225,6 +142,277 @@ class TableQAEvaluator:
                 )
             
         print(f"评估完成，结果已保存到 {result_path}")
+
+    def _parse_markdown_table(self, table_lines):
+        """Attempts to parse a simple Markdown table."""
+        header = []
+        data = []
+        separator_found = False
+        header_parsed = False
+
+        for i, line in enumerate(table_lines):
+            line = line.strip()
+            if not line:
+                continue
+
+            # Look for separator line (e.g., |---|---|)
+            if re.match(r'^[|\s]*[-:|]+[|\s]*$', line):
+                if header_parsed: # Separator must come after header
+                    separator_found = True
+                continue # Skip separator line from data
+
+            # If it's not the separator, parse as header or data
+            if '|' in line:
+                cells = [cell.strip() for cell in line.strip('|').split('|')]
+                if not header_parsed and not separator_found:
+                    header = cells
+                    header_parsed = True
+                elif header_parsed and separator_found:
+                    # Ensure row has same number of cells as header (or handle mismatch)
+                    if len(cells) == len(header):
+                       data.append(cells)
+                    else:
+                       print(f"Warning: Row data mismatch in Markdown table. Header has {len(header)} cols, row has {len(cells)}. Skipping row: {line}")
+
+        if header and data:
+            try:
+                return pd.DataFrame(data, columns=header)
+            except Exception as e:
+                print(f"Warning: Failed to create DataFrame from parsed Markdown: {e}")
+                return None
+        return None
+
+    def process_table_content(self, db_str, question):
+        """
+        解析多表格Markdown/CSV字符串，提取模式和相关行，
+        线性化处理，并在预算范围内进行标记化。
+
+        参数:
+        - db_str: 数据库表格字符串表示（Markdown或CSV格式）
+        - question: 用于相关性过滤的问题文本
+
+        返回:
+        - 处理后的表格token IDs (torch.Tensor)，如果处理失败则返回None
+        """
+        max_tokens = self.table_token_budget  # 使用__init__中定义的token预算
+        parsed_tables = []
+
+        # --- 1. 尝试解析多表格Markdown（使用##表头） ---
+        # 按'## table_name'表头分割，保留表头
+        table_sections = re.split(r'(^##\s+\w+\s*?$)', db_str, flags=re.MULTILINE)
+
+        current_table_name = "default_table"
+        content_buffer = []
+
+        if len(table_sections) <= 1:  # 没有找到'##'表头，作为单个块处理
+             content_buffer = db_str.strip().split('\n')
+             table_sections = []  # 清空sections以避免下面的处理
+        else:
+            # 遍历各部分，配对表头和内容
+            for section in table_sections:
+                section = section.strip()
+                if not section:
+                    continue
+                if section.startswith("##"):
+                    # 如果我们有*前一个*表的缓冲内容，处理它
+                    if content_buffer:
+                        df = self._parse_markdown_table(content_buffer)
+                        if df is not None:
+                             parsed_tables.append({"name": current_table_name, "df": df})
+                        else:
+                             print(f"警告: 无法将表'{current_table_name}'下的内容解析为Markdown格式。")
+                             # 可以选择在这里对该块尝试CSV解析
+                        content_buffer = []  # 重置缓冲区
+                    current_table_name = section.lstrip('#').strip()
+                else:
+                    # 将内容行添加到当前表的缓冲区
+                    content_buffer.extend(section.split('\n'))
+
+        # 处理缓冲区中的剩余内容（最后一个表或单个块）
+        if content_buffer:
+             df = self._parse_markdown_table(content_buffer)
+             if df is not None:
+                 parsed_tables.append({"name": current_table_name, "df": df})
+             else:
+                 # --- 2. 备选方案：尝试将整个块解析为CSV ---
+                 print(f"信息: '{current_table_name}'下的Markdown解析失败。尝试CSV解析。")
+                 try:
+                     # 尝试常见分隔符，注意错误处理
+                     delimiter = ',' if ',' in content_buffer[0] else ('|' if '|' in content_buffer[0] else '\t')
+                     csv_like_string = "\n".join(content_buffer)
+                     df = pd.read_csv(StringIO(csv_like_string), sep=delimiter, skipinitialspace=True)
+                     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)  # 清理空白
+                     parsed_tables.append({"name": current_table_name, "df": df})
+                     print(f"信息: 成功将'{current_table_name}'下的内容解析为CSV格式，使用分隔符'{delimiter}'。")
+                 except Exception as e:
+                     print(f"警告: 无法将'{current_table_name}'下的内容解析为Markdown或CSV格式: {e}")
+
+
+        # --- 3. 备选方案：如果没有成功解析任何表格 ---
+        if not parsed_tables:
+            print("警告: 无法从db_str解析任何结构化表格。使用原始字符串（截断）。")
+            # 截断原始字符串并标记化
+            encoded = self.tokenizer.encode(db_str)
+            if len(encoded) > max_tokens:
+                truncated_str = self.tokenizer.decode(encoded[:max_tokens], skip_special_tokens=True)
+                print(f"警告: 原始表格字符串被截断至约{max_tokens}个tokens。")
+            else:
+                truncated_str = db_str
+            return self.tokenizer(truncated_str, return_tensors='pt').input_ids
+
+        # --- 4. 线性化解析后的表格并进行相关性过滤 ---
+        compact_table_parts = []
+        question_keywords = set(question.lower().split())
+        rows_to_keep_per_table = 5  # 限制备选/非相关表格的行数
+
+        for table_info in parsed_tables:
+            table_name = table_info['name']
+            df = table_info['df']
+
+            if df.empty:
+                continue
+
+            compact_table_parts.append(f"表格: {table_name}")
+            schema_str = "模式: " + " | ".join(df.columns.astype(str))
+            compact_table_parts.append(schema_str)
+
+            # 基于简单关键词匹配找出相关行
+            relevant_indices = []
+            for index, row in df.iterrows():
+                try:
+                   row_text = ' '.join(map(str, row.fillna('').values)).lower()  # 处理NaN
+                   if any(keyword in row_text for keyword in question_keywords):
+                       relevant_indices.append(index)
+                except Exception:  # 捕获字符串转换过程中的潜在错误
+                    continue  # 如果转换失败则跳过该行
+
+            selected_indices = relevant_indices
+            if not relevant_indices:
+                # 备选方案：如果没有找到相关行，保留前N行
+                selected_indices = df.head(rows_to_keep_per_table).index.tolist()
+                if len(selected_indices) > 0:
+                   print(f"信息: 在表'{table_name}'中未找到基于关键词的相关行。使用前{len(selected_indices)}行。")
+
+            # 线性化选定的行
+            rows_added = 0
+            for index in selected_indices:
+                 try:
+                     row = df.loc[index]
+                     # 确保一致的字符串转换，处理潜在的NaN
+                     row_values_str = [str(v) if pd.notna(v) else '' for v in row.values]
+                     row_str = f"行 {index}: {' | '.join(row_values_str)}"
+                     compact_table_parts.append(row_str)
+                     rows_added += 1
+                 except KeyError:
+                     print(f"警告: 在表'{table_name}'的行线性化过程中未找到索引{index}。")
+                 except Exception as e:
+                     print(f"警告: 线性化表'{table_name}'的行{index}时出错: {e}")
+
+
+            if rows_added == 0 and len(selected_indices) > 0:
+                 print(f"Warning: Failed to linearize any selected rows for table '{table_name}'.")
+
+
+            compact_table_parts.append("---") # Separator between tables
+
+        # --- 5. Tokenize the Compact Representation ---
+        compact_table_str = "\n".join(compact_table_parts).strip().rstrip('---').strip() # Remove trailing separator
+
+        if not compact_table_str:
+             print("Warning: Generated compact table string is empty. Returning None.")
+             return None # Or handle as appropriate
+
+        #print(f"--- Compact Table String for Tokenization ---\n{compact_table_str}\n------------------------------------------") # Debug print
+
+        table_token_ids = self.tokenizer(
+            compact_table_str,
+            return_tensors='pt',
+            max_length=max_tokens,
+            truncation=True,
+            add_special_tokens=False # Usually False for context segments like tables
+        ).input_ids
+
+        # Check if truncation happened
+        if table_token_ids.shape[1] >= max_tokens:
+            print(f"Warning: Processed table content was truncated to {max_tokens} tokens.")
+
+        # print(f"--- Generated Table Token IDs ---\n{table_token_ids}\nShape: {table_token_ids.shape}\n--------------------------------") # Debug print
+        return table_token_ids
+
+    def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
+        """
+        回答问题 (Modified to pass question to process_table_content)
+        """
+        # ... (prompt loading and formatting remains the same) ...
+        prompt_template = self._load_prompt_templates(prompt_type)
+        # Make sure db_str in the prompt is the *original* one if needed by the template
+        # Or decide if the template should use the processed compact string (less likely)
+        full_prompt = prompt_template.format(db_str=db_str, question=question) # Use original db_str in prompt
+
+        if choices_str and "{choices_str}" not in prompt_template:
+            full_prompt += f"\n\n{choices_str}"
+        elif choices_str:
+            full_prompt = full_prompt.replace("{choices_str}", choices_str)
+
+        # Prepare input prompt tokens
+        messages = [{"role": "user", "content": full_prompt}]
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            # Truncation here applies to the *entire* input (prompt + potential space for answer)
+            # Consider max_length carefully based on model limits and expected answer length
+            truncation=True,
+            max_length=self.model.config.max_position_embeddings - self.generation_config.max_length # Reserve space for generation
+        ).to(self.device)
+
+        # --- Generate Table Token IDs for Injection ---
+        table_token_ids = None
+        use_table_token = prompt_type == "retrace_table"
+        if use_table_token:
+             # Pass the original db_str and the question to the processing function
+             table_token_ids = self.process_table_content(db_str, question)
+
+             # Ensure table_token_ids are on the correct device if not None
+             if table_token_ids is not None:
+                 table_token_ids = table_token_ids.to(self.device)
+
+
+        # --- Generate Answer ---
+        # Ensure table_token is handled correctly by your modified model.generate
+        outputs = self.model.generate(
+            **inputs,
+            generation_config=self.generation_config,
+            pad_token_id=self.tokenizer.eos_token_id, # Use EOS for padding during generation
+            max_new_tokens=800, # Controlled by generation_config.max_length now? Check precedence. Set max_new_tokens explicitly if needed.
+            temperature=0.85,
+            top_p=0.8,
+            do_sample=True,
+            repetition_penalty=1.0,
+            # Pass the processed table tokens *only* when using retrace_table
+            table_token=table_token_ids if use_table_token else None,
+            # Pass tokenizer only if needed by injection mechanism during generation (unlikely needed here)
+            tokenizer=self.tokenizer if use_table_token else None
+        )
+
+        # Decode the *generated part* only
+        # inputs.input_ids.shape[1] gives the length of the prompt
+        output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
+        response = self.tokenizer.decode(
+            output_token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+
+
+        return response.strip()
+
 
 def main():
     parser = argparse.ArgumentParser(description="表格问答评估工具")
