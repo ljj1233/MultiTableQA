@@ -46,7 +46,7 @@ class APIModelEvaluator:
         }
         
         # 确保提示目录存在
-        os.makedirs("d:/NLP/MultiTableQA/prompts", exist_ok=True)
+        os.makedirs("./prompts", exist_ok=True)
         
         # 加载提示模板
         for prompt_type, file_path in template_files.items():
