@@ -8,9 +8,10 @@ from symbolic import dataDict
 
 from tqdm import tqdm
 class TableQAEvaluator:
-    def __init__(self, model_path, device="cuda:0"):
+    def __init__(self, model_path, device="cuda:0", multi_gpu=False):
         # 初始化 TableLlama 模型
         self.device = device
+        self.multi_gpu = multi_gpu
 
         apply_table_function()
 
@@ -22,11 +23,20 @@ class TableQAEvaluator:
         }
         
         # 加载模型和分词器
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=self.config,
-            torch_dtype=torch.float16
-        ).to(device)
+        if multi_gpu and torch.cuda.device_count() > 1:
+            print(f"使用 {torch.cuda.device_count()} 个 GPU 进行并行计算")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=self.config,
+                torch_dtype=torch.float16,
+                device_map="auto"  # 自动分配到可用的GPU上
+            )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=self.config,
+                torch_dtype=torch.float16
+            ).to(device)
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.tokenizer.pad_token = self.tokenizer.eos_token   
@@ -104,10 +114,11 @@ class TableQAEvaluator:
             **inputs,
             generation_config=self.generation_config,
             pad_token_id=self.tokenizer.eos_token_id,
-            max_new_tokens=512,
-            temperature=0.7,
-            top_p=0.9,
+            max_new_tokens=800,
+            temperature=0.85,
+            top_p=0.8,
             do_sample=True,
+            repetition_penalty=1.0,
             table_token=db_str if use_table_token else None,  # 只在特定模式下传入表格内容
             tokenizer=self.tokenizer if use_table_token else None
         )
@@ -206,11 +217,13 @@ def main():
     parser.add_argument("--prompt_type", type=str, default="default", 
                         choices=["default", "cot", "retrace_table"],
                         help="提示类型: default(原始提问), cot(思维链), retrace_table(表格增强)")
+    parser.add_argument("--device", type=str, default="cuda:0", help="指定使用的设备，例如 'cuda:0'")
+    parser.add_argument("--multi_gpu", action="store_true", help="是否使用多GPU并行计算")
     
     args = parser.parse_args()
     
-    # 初始化评估器
-    evaluator = TableQAEvaluator(args.model_path)
+    # 初始化评估器，传入设备和多GPU参数
+    evaluator = TableQAEvaluator(args.model_path, device=args.device, multi_gpu=args.multi_gpu)
     
     # 如果不使用表格增强功能，则禁用它
     if args.prompt_type != "retrace_table":
@@ -247,7 +260,9 @@ def main():
 # Single question test example
 def test_single_question():
     model_path = "chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct"
-    evaluator = TableQAEvaluator(model_path)
+    # 检测是否有多个GPU可用
+    multi_gpu = torch.cuda.device_count() > 1
+    evaluator = TableQAEvaluator(model_path, multi_gpu=multi_gpu)
 
     # Table content for multi-table association
     table_content = """
