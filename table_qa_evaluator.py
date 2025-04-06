@@ -162,10 +162,7 @@ class TableQAEvaluator:
         """
         回答问题 (Modified to pass question to process_table_content)
         """
-        # ... (prompt loading and formatting remains the same) ...
         prompt_template = self._load_prompt_templates(prompt_type)
-        # Make sure db_str in the prompt is the *original* one if needed by the template
-        # Or decide if the template should use the processed compact string (less likely)
         full_prompt = prompt_template.format(db_str=db_str, question=question) # Use original db_str in prompt
 
         if choices_str and "{choices_str}" not in prompt_template:
@@ -185,8 +182,6 @@ class TableQAEvaluator:
             prompt,
             return_tensors="pt",
             padding=True,
-            # Truncation here applies to the *entire* input (prompt + potential space for answer)
-            # Consider max_length carefully based on model limits and expected answer length
             truncation=True,
             max_length=self.model.config.max_position_embeddings - self.generation_config.max_length # Reserve space for generation
         ).to(self.device)
@@ -198,7 +193,6 @@ class TableQAEvaluator:
              # 使用表格处理器处理表格内容
              table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
 
-             # Ensure table_token_ids are on the correct device if not None
              if table_token_ids is not None:
                  table_token_ids = table_token_ids.to(self.device)
 
@@ -214,23 +208,21 @@ class TableQAEvaluator:
             top_p=0.8,
             do_sample=True,
             repetition_penalty=1.0,
-            # Pass the processed table tokens *only* when using retrace_table
             table_token=table_token_ids if use_table_token else None,
-            # Pass tokenizer only if needed by injection mechanism during generation (unlikely needed here)
             tokenizer=self.tokenizer if use_table_token else None
         )
 
         # Decode the *generated part* only
         # inputs.input_ids.shape[1] gives the length of the prompt
-        output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
+        # output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
         response = self.tokenizer.decode(
-            output_token_ids,
+            outputs[0],
             skip_special_tokens=True,
             clean_up_tokenization_spaces=True
         )
 
 
-        return response.strip()
+        return response
 
 
 def main():
@@ -255,7 +247,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0", help="指定使用的设备，例如 'cuda:0'")
     parser.add_argument("--multi_gpu", action="store_true", help="是否使用多GPU并行计算")
     parser.add_argument("--use_llm_relevance", action="store_true", 
-                        help="使用LLM进行表格相关性筛选（可能会增加处理时间）")
+                        help="使用LLM进行表格相关性筛选(可能会增加处理时间)")
     
     args = parser.parse_args()
     
