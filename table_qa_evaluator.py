@@ -74,6 +74,25 @@ class TableQAEvaluator:
         table_token_ids = self.tokenizer(db_str, return_tensors='pt').input_ids
         return table_token_ids
     
+    def _load_prompt_templates(self,prompt_type="default"):
+        """
+        加载提示模板
+        
+        Returns:
+            提示模板
+        """
+        prompt_file_path = os.path.join("./prompts", f"{prompt_type}_prompt.txt")
+        
+        try:
+            with open(prompt_file_path, 'r', encoding='utf-8') as f:
+                prompt_template = f.read()
+        except FileNotFoundError:
+            print(f"警告: 未找到提示文件 {prompt_file_path}，使用默认提示")
+            # 如果找不到文件，使用默认提示
+            prompt_template = "Please carefully analyze and answer the following question:\n\n{db_str}\n\n{question}\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
+        
+        return prompt_template
+
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
         """
         回答问题
@@ -88,17 +107,7 @@ class TableQAEvaluator:
         返回:
         - 模型的回答
         """
-        # 根据提示类型读取对应的prompt文件
-        prompt_file_path = os.path.join("./prompts", f"{prompt_type}_prompt.txt")
-        
-        try:
-            with open(prompt_file_path, 'r', encoding='utf-8') as f:
-                prompt_template = f.read()
-        except FileNotFoundError:
-            print(f"警告: 未找到提示文件 {prompt_file_path}，使用默认提示")
-            # 如果找不到文件，使用默认提示
-            prompt_template = "Please carefully analyze and answer the following question:\n\n{db_str}\n\n{question}\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
-        
+        prompt_template = self._load_prompt_templates(prompt_type)
         # 替换模板中的占位符
         full_prompt = prompt_template.format(db_str=db_str,question=question)
         print(f'full_prompt: {full_prompt}')

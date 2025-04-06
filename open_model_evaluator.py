@@ -16,7 +16,7 @@ from Utils.jsTool import JS
 from eval.evaluator import evalAcc
 
 class TableLlamaEvaluator:
-    def __init__(self, model_path, device="cuda:0"):
+    def __init__(self, model_path, device="cuda:0", multi_gpu=False):
         """
         初始化 TableLlama 模型
         
@@ -26,6 +26,7 @@ class TableLlamaEvaluator:
         """
         self.device = device
         self.model_path = model_path
+        self.multi_gpu = multi_gpu
 
         # 应用表格函数增强
         apply_table_function()
@@ -38,11 +39,20 @@ class TableLlamaEvaluator:
         }
         
         # 加载模型和分词器
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=self.config,
-            torch_dtype=torch.float16
-        ).to(device)
+        if multi_gpu and torch.cuda.device_count() > 1:
+            print(f"使用 {torch.cuda.device_count()} 个 GPU 进行并行计算")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=self.config,
+                torch_dtype=torch.float16,
+                device_map="auto"  # 自动分配到可用的GPU上
+            )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=self.config,
+                torch_dtype=torch.float16
+            ).to(device)
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.tokenizer.pad_token = self.tokenizer.eos_token   
@@ -67,35 +77,26 @@ class TableLlamaEvaluator:
         )
         print(f"模型 {model_path} 已加载完成")
         
-        # 加载提示模板
-        self.prompt_templates = self._load_prompt_templates()
 
-    def _load_prompt_templates(self):
+    def _load_prompt_templates(self,prompt_type="default"):
         """
         加载提示模板
         
         Returns:
-            提示模板字典
+            提示模板
         """
-        templates = {}
-        template_files = {
-            "default": "./prompts/default_prompt.txt",
-            "cot": "./prompts/cot_prompt.txt",
-            "retrace_table": "./prompts/retrace_table_prompt.txt"
-        }
+        prompt_file_path = os.path.join("./prompts", f"{prompt_type}_prompt.txt")
         
-        # 确保提示目录存在
-        os.makedirs("./prompts", exist_ok=True)
+        try:
+            with open(prompt_file_path, 'r', encoding='utf-8') as f:
+                prompt_template = f.read()
+        except FileNotFoundError:
+            print(f"警告: 未找到提示文件 {prompt_file_path}，使用默认提示")
+            # 如果找不到文件，使用默认提示
+            prompt_template = "Please carefully analyze and answer the following question:\n\n{db_str}\n\n{question}\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
         
-        # 加载提示模板
-        for prompt_type, file_path in template_files.items():
-            if os.path.exists(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    templates[prompt_type] = f.read().strip()
-            else:
-                print(f"警告: 提示模板文件 {file_path} 不存在")
-        
-        return templates
+        return prompt_template
+
     def process_table_content(self, db_str):
         """
         处理表格内容，将其转换为模型可用的格式
@@ -126,7 +127,7 @@ class TableLlamaEvaluator:
             模型的回答
         """
         # 获取提示模板
-        template = self.prompt_templates.get(prompt_type, self.prompt_templates["default"])
+        template = self._load_prompt_templates(prompt_type)
         
         # 填充模板
         full_prompt = template.format(db_str=db_str, question=question)
@@ -191,11 +192,13 @@ def main():
                         help="提示类型: default(原始提问), cot(思维链), retrace_table(表格增强)")
     parser.add_argument("--log_root", type=str, default=None, help="日志根目录")
     parser.add_argument("--result_path", type=str, default=None, help="结果JSON路径")
-    
+    parser.add_argument("--multi_gpu", action="store_true", help="是否使用多GPU并行计算")
+    parser.add_argument("--device", type=str, default="cuda:0", help="指定使用的设备，例如 'cuda:0'")
+
     args = parser.parse_args()
     
     # 初始化模型
-    evaluator = TableLlamaEvaluator(args.model_path)
+    evaluator = TableLlamaEvaluator(args.model_path, device=args.device, multi_gpu=args.multi_gpu)
     
     # 如果不使用表格增强功能，则禁用它
     if args.prompt_type != "retrace_table":
