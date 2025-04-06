@@ -64,126 +64,115 @@ logger.setLevel(logging.WARNING)
 
 
 class LlamaMLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        #输入的隐藏状态映射到中间维度intermediate_size  -- 作用是生成一个门控信号
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        #对输入进行升维
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        #对输入进行降维到原始的隐藏状态
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
         # --- Table Injection Parameters ---
-        self.apply_table_injection = False  # 全局开关，控制是否启用表格注入
-        self.table_token = None           # 存储表格的嵌入表示
-        self.retracing_ratio = 0            # 注入强度，控制表格特征的影响程度
-        self.entropy_threshold = 1.0        # 触发阈值，当模型熵值超过此值时触发注入
-        self.starting_layer = 0             # 开始注入的层
-        self.ending_layer = 32              # 结束注入的层
-        self.adapt_signal = 0               # 控制信号：0表示正常FFN，1表示注入表格信息
+        self.apply_table_injection = False
+        # Store the sequence embedding directly, not adapter weights
+        self.table_token = None  
+        self.table_embedding = None # Shape: (SeqLen_table, Hidden)
+        self.retracing_ratio = 0.05 # Example: Blending factor for the attention output
+        self.entropy_threshold = 1.0
+        self.starting_layer = 0
+        self.ending_layer = 32
+        self.adapt_signal = 0
 
-        # Adapter weights - initialized when triggered
-        self.adpt_w1 = None
-        self.adpt_w2 = None
-        # --- End Table Injection Parameters ---
-    
-    def forward(self,x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
+        # --- No learnable adapter weights (adpt_w1, adpt_w2 removed) ---
+        # --- No learnable cross-attention layer ---
 
-            gate_proj = torch.cat(
-                [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
-            )
-            up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
+        # Hyperparameter for non-learnable attention
+        self.attention_temperature = self.hidden_size**0.5
 
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        elif self.adapt_signal == 0:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        elif self.adapt_signal == 1:
-            # --- Table Injection Path ---
-            # Ensure adapter weights are ready (should have been set by trigger logic)
-            if self.adpt_w1 is None or self.adpt_w2 is None:
-                 print(f"Warning: adapt_signal==1 but adapter weights not initialized in MLP. Falling back to normal FFN.")
-                 down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-            else:
-                # 1. Calculate standard FFN output
-                ffn_out = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    def initialize_table_embedding(self, table_embedding):
+        """Stores the processed table embedding sequence. Non-learnable."""
 
-                # 2. Calculate adapter output using adapter weights
-                self.adpt_w1 = self.adpt_w1.to(x.device)
-                self.adpt_w2 = self.adpt_w2.to(x.device)
-                adapter_out = torch.matmul(torch.matmul(x, self.adpt_w1.T), self.adpt_w2.T) # (B, S, H) -> (B, S, I) -> (B, S, H)
+        ref_param = self.gate_proj.weight
+        target_device = ref_param.device
+        target_dtype = ref_param.dtype
 
-                # 3. Normalize adapter output magnitude
-                epsilon = 1e-6
-                ffn_mean_abs = torch.mean(torch.abs(ffn_out)).clamp(min=epsilon)
-                adapter_mean_abs = torch.mean(torch.abs(adapter_out)).clamp(min=epsilon)
-                norm_adapter_out = (ffn_mean_abs / adapter_mean_abs) * adapter_out
-                # 4. Blend FFN output and normalized adapter output
-                down_proj = (ffn_out * (1 - self.retracing_ratio) + norm_adapter_out * self.retracing_ratio)
-
-        return down_proj
-
-    def initialize_adapter_weights(self, table_embedding):
-        """Initializes adapter weights based on the table embedding."""
-        if table_embedding is None:
-            print("Info: table_embedding is None in initialize_adapter_weights. Skipping initialization.")
-            self.adpt_w1 = None
-            self.adpt_w2 = None
-            return
-
-        target_device = self.gate_proj.weight.device
-        target_dtype = self.gate_proj.weight.dtype
         table_embedding = table_embedding.to(target_device, dtype=target_dtype)
 
-        original_shape = table_embedding.shape
-        processed_embedding = None
+        if table_embedding.ndim == 3 and table_embedding.shape[0] == 1:
+            # Squeeze batch dim: Result shape (SeqLen_table, H)
+            self.table_seq_embedding = table_embedding.squeeze(0)
+            # print(f"DEBUG: Stored table_seq_embedding with shape {self.table_seq_embedding.shape}")
 
-        # --- MODIFIED SHAPE HANDLING ---
-        if table_embedding.ndim == 3 and table_embedding.shape[0] == 1 and table_embedding.shape[2] == self.hidden_size:
-            # --- ADDED CASE for (1, Sequence Length, H) ---
-            # Assume Sequence Length > 1 (like the error case 1, 51, 4096)
-            # Or Sequence Length == 1 (like 1, 1, 4096)
-            # Calculate mean over the sequence dimension (dim=1)
-            averaged_embedding = table_embedding.mean(dim=1) # Shape becomes (1, H)
-            # Squeeze the batch dimension (dim=0)
-            processed_embedding = averaged_embedding.squeeze(0) # Shape becomes (H,)
+    def forward(self, x): # x shape: (Batch, SeqLen_x, Hidden)
+
+        if self.config.pretraining_tp > 1:
+            print("Warning: Tensor Parallel > 1 detected. Injection logic might need adjustment. Falling back.")
+            ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            down_proj = self.down_proj(ffn_intermediate)
+            return down_proj 
+
+
+        # --- Injection Logic ---
+        # Check if injection is active and table embedding is available
+        if self.adapt_signal == 1 and self.table_seq_embedding is not None:
+            # --- Non-Learnable Cross-Attention Path ---
+            try:
+                # 1. Calculate standard FFN output (can potentially be optimized later)
+                ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+                ffn_out = self.down_proj(ffn_intermediate)
+
+                # 2. Prepare query (x) and key/value (table_seq_embedding)
+                query = x # (B, S_x, H)
+                key = self.table_seq_embedding # (S_table, H)
+                value = self.table_seq_embedding # (S_table, H)
+
+                # Ensure key/value are on the same device as query
+                key = key.to(query.device, dtype=query.dtype)
+                value = value.to(query.device, dtype=query.dtype)
+
+                # 3. Calculate Similarity Scores (using Cosine Similarity)
+                # Normalize vectors for cosine similarity calculation
+                query_norm = F.normalize(query, p=2, dim=-1) # (B, S_x, H)
+                key_norm = F.normalize(key, p=2, dim=-1)   # (S_table, H)
+
+                # Calculate batched dot product for similarity: (B, S_x, H) @ (H, S_table) -> (B, S_x, S_table)
+                # Transpose key_norm for matmul
+                similarity_scores = torch.matmul(query_norm, key_norm.t()) # Result shape (B, S_x, S_table)
+
+                # 4. Get Attention Weights via Softmax
+                # Scale scores by temperature before softmax for better distribution
+                attention_weights = F.softmax(similarity_scores / self.attention_temperature, dim=-1)
+                # attention_weights shape: (B, S_x, S_table)
+
+                # 5. Compute Weighted Sum of Values
+                # Need value shape (S_table, H). Expand for batch matmul if needed: (B, S_table, H)
+                value_expanded = value.unsqueeze(0).expand(x.shape[0], -1, -1) # (B, S_table, H)
+                # Weighted sum: (B, S_x, S_table) @ (B, S_table, H) -> (B, S_x, H)
+                attn_output = torch.matmul(attention_weights, value_expanded)
+
+                # 6. Combine FFN output and Attention output
+                # Simple blending using the retracing ratio
+                # Ensure attn_output is scaled appropriately if needed, but direct blending is common
+                down_proj = (ffn_out * (1 - self.retracing_ratio) + attn_output * self.retracing_ratio)
+
+                # Optional: Add Layer Normalization after blending (using a pre-defined LN if desired)
+                # if hasattr(self, 'output_layer_norm'): # Check if you added one in __init__
+                #    down_proj = self.output_layer_norm(down_proj)
+
+            except Exception as e:
+                print(f"Error during non-learnable cross-attention: {e}. Falling back to normal FFN.")
+                # Fallback to normal FFN path on error
+                ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+                down_proj = self.down_proj(ffn_intermediate)
 
         else:
-             # If shape is still unexpected
-             self.adpt_w1 = None
-             self.adpt_w2 = None
-             return
-        # --- END OF MODIFIED SHAPE HANDLING ---
+            # (If adapt_signal is 0 or table_seq_embedding is None)
+            ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            down_proj = self.down_proj(ffn_intermediate)
 
-        # Now processed_embedding should have shape (H,)
-        epsilon = 1e-6
-        # Ensure weight dtype matches embedding dtype for calculations
-        up_weight = self.up_proj.weight.to(dtype=target_dtype)
-        down_weight = self.down_proj.weight.to(dtype=target_dtype)
-
-        scale_factor1 = (torch.mean(torch.abs(up_weight))) / (torch.mean(torch.abs(processed_embedding)).clamp(min=epsilon))
-        scale_factor2 = (torch.mean(torch.abs(down_weight))) / (torch.mean(torch.abs(processed_embedding)).clamp(min=epsilon))
-
-        # Original logic now works correctly because processed_embedding is (H,)
-        init_w1 = (scale_factor1 * processed_embedding).unsqueeze(0).repeat(self.hidden_size, 1) # (H, H)
-        init_w2 = (scale_factor2 * processed_embedding).unsqueeze(1).repeat(1, self.hidden_size) # (H, H)
-
-        # Assign initialized weights
-        self.adpt_w1 = init_w1
-        self.adpt_w2 = init_w2
+        return down_proj
 
 def table_forward(
         self,
@@ -321,7 +310,7 @@ def table_forward(
 
                 current_table_token = self.layers[0].mlp.table_token.to(input_ids.device)  # Retrieve shared token
                 table_embeds = self.embed_tokens(current_table_token)
-                next_layer_mlp.initialize_adapter_weights(table_embeds)
+                next_layer_mlp.initialize_table_embedding(table_embeds)
                 # print(f"add table feature to layer {layer_idx}")
                 next_layer_mlp.adapt_signal = 1
                 next_layer_mlp.retracing_ratio = retracing_ratio
@@ -388,6 +377,7 @@ def generate(
         logger.info("No table_token provided, disabling table injection...")
         if hasattr(self.model.layers[0].mlp, 'table_token'):
             self.model.layers[0].mlp.table_token = None
+            self.model.layers[0].mlp.table_seq_embedding = False
             
 
     generation_config, model_kwargs = self._prepare_generation_config(
