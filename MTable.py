@@ -152,15 +152,7 @@ class LlamaMLP(nn.Module):
         processed_embedding = None
 
         # --- MODIFIED SHAPE HANDLING ---
-        if table_embedding.ndim == 1 and table_embedding.shape[0] == self.hidden_size:
-            # Shape (H,) - Already correct
-            processed_embedding = table_embedding
-
-        elif table_embedding.ndim == 2 and table_embedding.shape[0] == 1 and table_embedding.shape[1] == self.hidden_size:
-            # Shape (1, H) -> Squeeze to (H,)
-            processed_embedding = table_embedding.squeeze(0)
-
-        elif table_embedding.ndim == 3 and table_embedding.shape[0] == 1 and table_embedding.shape[2] == self.hidden_size:
+        if table_embedding.ndim == 3 and table_embedding.shape[0] == 1 and table_embedding.shape[2] == self.hidden_size:
             # --- ADDED CASE for (1, Sequence Length, H) ---
             # Assume Sequence Length > 1 (like the error case 1, 51, 4096)
             # Or Sequence Length == 1 (like 1, 1, 4096)
@@ -175,12 +167,6 @@ class LlamaMLP(nn.Module):
              self.adpt_w2 = None
              return
         # --- END OF MODIFIED SHAPE HANDLING ---
-
-        # --- Check final shape after processing ---
-        if processed_embedding is None or processed_embedding.ndim != 1 or processed_embedding.shape[0] != self.hidden_size:
-             self.adpt_w1 = None
-             self.adpt_w2 = None
-             return
 
         # Now processed_embedding should have shape (H,)
         epsilon = 1e-6
@@ -378,7 +364,7 @@ def generate(
     negative_prompt_attention_mask: Optional[torch.Tensor] = None,
     use_model_defaults: Optional[bool] = None,
     *,  # Force subsequent args to be keyword args
-    table_token: Optional[str] = None,  # New argument for table content
+    table_token: Optional[torch.Tensor] = None,  # New argument for table content
     **kwargs,
 ):
 
@@ -393,18 +379,16 @@ def generate(
         else:
             kwargs.pop("table_token")  # Remove if passed redundantly
 
-    # 处理表格内容，如果为None或空字符串，则清除之前的表格内容
-    if table_token and tokenizer:
+    # 处理表格内容，如果为None，则清除之前的表格内容
+    if table_token is not None:
         logger.info("Processing table_token for injection...")
-        table_token_ids = tokenizer(table_token, return_tensors='pt').input_ids
-        self.model.layers[0].mlp.table_token = table_token_ids
-    elif table_token is None or table_token.strip() == "":
-        # 如果表格内容为None或空字符串，清除之前的表格内容
+        self.model.layers[0].mlp.table_token = table_token
+    else:
+        # 如果表格内容为None，清除之前的表格内容
         logger.info("No table_token provided, disabling table injection...")
         if hasattr(self.model.layers[0].mlp, 'table_token'):
             self.model.layers[0].mlp.table_token = None
-    elif table_token and not tokenizer:
-        logger.warning("`table_token` was provided, but tokenizer is not available on the model instance. Cannot process table.")
+            
 
     generation_config, model_kwargs = self._prepare_generation_config(
         generation_config, use_model_defaults, **kwargs

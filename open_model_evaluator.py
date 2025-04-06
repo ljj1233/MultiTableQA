@@ -96,6 +96,21 @@ class TableLlamaEvaluator:
                 print(f"警告: 提示模板文件 {file_path} 不存在")
         
         return templates
+    def process_table_content(self, db_str):
+        """
+        处理表格内容，将其转换为模型可用的格式
+        
+        Args:
+            db_str: 数据库表格的字符串表示
+            
+        Returns:
+            处理后的表格特征（当前实现为token IDs）
+        """
+        # 当前实现：直接将表格文本转换为token IDs
+        # 后续可以在这里实现更复杂的表格特征提取逻辑
+        table_token_ids = self.tokenizer(db_str, return_tensors='pt').input_ids
+        return table_token_ids.to(self.device)
+        
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
         """
         回答问题
@@ -138,6 +153,8 @@ class TableLlamaEvaluator:
 
         # 生成回答
         use_table_token = prompt_type == "retrace_table"  # 只在 retrace_table 模式下传入表格内容
+        table_token_ids = self.process_table_content(db_str) if use_table_token else None
+
         outputs = self.model.generate(
             **inputs,
             generation_config=self.generation_config,
@@ -146,7 +163,7 @@ class TableLlamaEvaluator:
             temperature=0.7,
             top_p=0.9,
             do_sample=True,
-            table_token=db_str if use_table_token else None,  # 只在特定模式下传入表格内容
+            table_token=table_token_ids,   
             tokenizer=self.tokenizer if use_table_token else None
         )
 

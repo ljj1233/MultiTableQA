@@ -58,7 +58,22 @@ class TableQAEvaluator:
                 retracing_ratio=0.02
             )
         print(f"模型 {model_path} 已加载完成")
-
+    
+    def process_table_content(self, db_str):
+        """
+        处理表格内容，将其转换为模型可用的格式
+        
+        参数:
+        - db_str: 数据库表格的字符串表示
+        
+        返回:
+        - 处理后的表格特征（当前实现为token IDs）
+        """
+        # 当前实现：直接将表格文本转换为token IDs
+        # 后续可以在这里实现更复杂的表格特征提取逻辑
+        table_token_ids = self.tokenizer(db_str, return_tensors='pt').input_ids
+        return table_token_ids
+    
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
         """
         回答问题
@@ -110,6 +125,10 @@ class TableQAEvaluator:
 
         # 生成回答
         use_table_token = prompt_type == "retrace_table"  # 只在 retrace_table 模式下传入表格内容
+        
+        # 使用封装的函数处理表格内容
+        table_token_ids = self.process_table_content(db_str) if use_table_token else None
+        
         outputs = self.model.generate(
             **inputs,
             generation_config=self.generation_config,
@@ -119,7 +138,7 @@ class TableQAEvaluator:
             top_p=0.8,
             do_sample=True,
             repetition_penalty=1.0,
-            table_token=db_str if use_table_token else None,  # 只在特定模式下传入表格内容
+            table_token=table_token_ids ,  # 只在特定模式下传入表格内容
             tokenizer=self.tokenizer if use_table_token else None
         )
 
