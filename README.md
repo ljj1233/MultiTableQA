@@ -125,3 +125,8 @@ python ./table_qa_evaluator.py \
   --time_sleep 10 \
    --multi_gpu
 ```
+
+```bash 
+# 调用API模型
+python llama_demo.py  --db_root "dataset/task/scaledDB" --task_path "dataset/task/tableQA/dataset.sqlite" --result_path "dataset/results/tableQA/api_default.sqlite" --dataset "TableQA" --scale "8k" "16k" --prompt_type "default" --db_limit 5 --sample_limit 1 --question_limit 3
+```
