@@ -68,7 +68,7 @@ python ./open_model_evaluator.py \
   --scale 16k \
   --prompt_type retrace_table \
   --markdown \
-  --log_root d:\NLP\MultiTableQA\logs\qa_retrace
+  --log_root .\logs\qa_retrace
 ```
 
 ### 2. 使用表格问答评估器
@@ -111,14 +111,14 @@ python ./table_qa_evaluator.py \
 python ./table_qa_evaluator.py \
   --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
   --db_root dataset/task/scaledDB \
-  --task_path dataset/task/TableQA/dataset.sqlite \
-  --result_path dataset/results/TableQA/llama3_retrace_md.sqlite \
+  --task_path dataset/task/tableQA/dataset.sqlite \
+  --result_path dataset/results/tableQA/llama3_retrace.sqlite \
   --dataset TableQA \
-  --scale 32k \
+  --scale 8k \
   --prompt_type retrace_table \
   --markdown \
   --db_limit 5 \
   --sample_limit 1 \
-  --question_limit 14 \
-  --time_sleep 60
+  --question_limit 2 \
+  --time_sleep 10
 ```

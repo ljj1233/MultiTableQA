@@ -7,6 +7,9 @@ from MTable import apply_table_llama, apply_table_function
 from Utils.dataLoader import TaskCore
 from Utils.table_relevance import TableRelevanceExtractor
 from Utils.table_parser import parse_markdown_table  
+from Utils.table_processor import TableProcessor  
+from Utils.table_processor_single import SingleTableProcessor  
+
 from symbolic import dataDict
 import pandas as pd
 from io import StringIO
@@ -18,7 +21,7 @@ class TableQAEvaluator:
         self.device = device
         self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 2048  # 增加token预算以处理更多表格数据
+        self.table_token_budget = 4096  # 增加token预算以处理更多表格数据
         
         apply_table_function()
 
@@ -70,7 +73,9 @@ class TableQAEvaluator:
         self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
         
         # 初始化表格处理器
-        self.table_processor = TableProcessor(self.tokenizer, self.relevance_extractor, self.device, self.table_token_budget)
+        self.table_processor = SingleTableProcessor(self.tokenizer, self.device, self.table_token_budget)
+
+        # self.table_processor = TableProcessor(self.tokenizer, self.relevance_extractor, self.device, self.table_token_budget)
   
 
     def _load_prompt_templates(self,prompt_type="default"):

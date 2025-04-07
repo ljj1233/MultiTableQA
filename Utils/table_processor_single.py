@@ -4,7 +4,7 @@ import pandas as pd
 from io import StringIO
 from .table_parser import parse_markdown_table
 
-class TableProcessor:
+class SingleTableProcessor:
     """
     简单表格处理器
     仅对表格内容进行分词，不做任何预处理
