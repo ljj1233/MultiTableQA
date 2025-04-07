@@ -176,7 +176,7 @@ class TaskCore:
                         dbStr = " ".join(dbStrList)
                     else:
                         dbStr = f"#{dbn}\n\n{db.defaultSerialization(markdown)}"
-                    print(dbStr)
+                    # print(dbStr)
                     choicesStr = TaskCore.generateChoices(item[-4:])
                     gt = TaskCore.getRightChoices(item[-5])
                     question = item[-6]

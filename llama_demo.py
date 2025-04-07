@@ -35,20 +35,13 @@ class TableLlamaAPI:
         """
         prompt_file_path = os.path.join("./prompts", f"{prompt_type}_prompt.txt")
         
-        try:
-            with open(prompt_file_path, 'r', encoding='utf-8') as f:
-                prompt_template = f.read()
-        except FileNotFoundError:
-            print(f"警告: 未找到提示文件 {prompt_file_path}，使用默认提示")
-            # 如果找不到文件，使用默认提示
-            if prompt_type == "default":
-                prompt_template = "Please carefully analyze and answer the following question:\n\n{db_str}\n\n{question}\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
-            elif prompt_type == "cot":
-                prompt_template = "Please carefully analyze and answer the following question step by step:\n\n{db_str}\n\n{question}\n\nThis question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`."
         
+        with open(prompt_file_path, 'r', encoding='utf-8') as f:
+            prompt_template = f.read()
         return prompt_template
 
-    def chat(self, message, temperature=0.7, max_tokens=2048,top_p=0.8):
+
+    def chat(self, message, temperature=0.7, max_tokens=2048, top_p=0.8):
         """
         使用 API 进行对话
         
@@ -56,9 +49,10 @@ class TableLlamaAPI:
             message: 用户消息
             temperature: 温度参数
             max_tokens: 最大生成 token 数
+            top_p: 核采样参数
             
         返回:
-            模型回复
+            模型回复和token统计
         """
         try:
             response = self.client.chat.completions.create(
@@ -75,13 +69,19 @@ class TableLlamaAPI:
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
-                top_p =top_p,
+                top_p=top_p,
                 stream=False
             )
-            return response.choices[0].message.content
+            # 获取token统计信息
+            token_stats = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
+            }
+            return response.choices[0].message.content, token_stats
         except Exception as e:
             print(f"API 调用出错: {e}")
-            return f"发生错误: {str(e)}"
+            return f"发生错误: {str(e)}", None
 
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
         """
@@ -110,11 +110,17 @@ class TableLlamaAPI:
             full_prompt = full_prompt.replace("{choices_str}", choices_str)
         
         # 调用 API
-        response = self.chat(full_prompt, temperature=0.85)
+        response, token_stats = self.chat(full_prompt, temperature=0.85)
         
         # 确保回答包含答案格式
         if "answer:" not in response.lower():
             print("警告: 回答中未找到 'Answer:' 格式")
+        
+        # 如果有token统计，打印出来
+        if token_stats:
+            print(f"Token统计: 提示tokens={token_stats['prompt_tokens']}, "
+                  f"生成tokens={token_stats['completion_tokens']}, "
+                  f"总tokens={token_stats['total_tokens']}")
         
         return response
 
@@ -188,10 +194,12 @@ def main():
     parser = argparse.ArgumentParser(description="多表格问答评估")
     parser.add_argument("--api_base_url", type=str, default="https://api-inference.modelscope.cn/v1/", 
                         help="API基础URL")
-    # parser.add_argument("--api_key", type=str, required=True, 
-    #                     help="API密钥")
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct", 
+    parser.add_argument("--api_key", type=str, default="ee92f5a9-4138-4235-81c7-e1f6cb8c23ca", 
+                        help="API密钥")
+    parser.add_argument("--model_name", type=str, default="LLM-Research/Meta-Llama-3.1-8B-Instruct", 
                         help="模型名称")
+    # parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct", 
+    #                     help="模型名称")
     parser.add_argument("--db_root", type=str, required=True, 
                         help="数据库根目录")
     parser.add_argument("--task_path", type=str, required=True, 
@@ -299,6 +307,7 @@ def test_single_question():
         print(f"\n===== 提示类型: {prompt_type} =====")
         response = evaluator.answer_question(table_content, question, "", prompt_type=prompt_type)
         print("回答:", response)
+        print("-" * 50)
 
 
 if __name__ == "__main__":
