@@ -87,7 +87,8 @@ python ./table_qa_evaluator.py \
   --scale 8k \
   --db_limit 5 \
   --sample_limit 1 \
-  --question_limit 5
+  --question_limit 5 \
+   --multi_gpu
 ```
 
 ```bash 
@@ -103,7 +104,8 @@ python ./table_qa_evaluator.py \
   --db_limit 5 \
   --sample_limit 1 \
   --question_limit 14 \
-  --time_sleep 30
+  --time_sleep 30 \
+   --multi_gpu
 ```
 
 ```bash 
@@ -120,5 +122,6 @@ python ./table_qa_evaluator.py \
   --db_limit 5 \
   --sample_limit 1 \
   --question_limit 2 \
-  --time_sleep 10
+  --time_sleep 10 \
+   --multi_gpu
 ```

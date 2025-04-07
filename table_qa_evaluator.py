@@ -53,10 +53,9 @@ class TableQAEvaluator:
         
         # 初始化生成配置
         self.generation_config = GenerationConfig(
-            max_length=800,
             num_beams=5,
             no_repeat_ngram_size=2,
-            early_stopping=True,
+            early_stopping=False,
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id
         )
@@ -65,7 +64,7 @@ class TableQAEvaluator:
                 starting_layer=8,
                 ending_layer=12,
                 entropy_threshold=0.9,
-                retracing_ratio=0.02
+                retracing_ratio=0.01
             )
         print(f"模型 {model_path} 已加载完成")
         
@@ -182,7 +181,6 @@ class TableQAEvaluator:
             tokenize=False,
             add_generation_prompt=True
         )
-
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
@@ -207,8 +205,7 @@ class TableQAEvaluator:
         outputs = self.model.generate(
             **inputs,
             generation_config=self.generation_config,
-            pad_token_id=self.tokenizer.eos_token_id, # Use EOS for padding during generation
-            max_new_tokens=800, # Controlled by generation_config.max_length now? Check precedence. Set max_new_tokens explicitly if needed.
+            max_new_tokens=5192, 
             temperature=0.85,
             top_p=0.8,
             do_sample=True,
@@ -220,12 +217,14 @@ class TableQAEvaluator:
         # Decode the *generated part* only
         # inputs.input_ids.shape[1] gives the length of the prompt
         # output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
+        print(f'outputs: {outputs}')
         response = self.tokenizer.decode(
-            outputs[0],
+            outputs[-1],
             skip_special_tokens=True,
             clean_up_tokenization_spaces=True
         )
-
+        tokens = self.tokenizer.encode(response, add_special_tokens=False)
+        print(f"response 的 token 数量: {len(tokens)}")
 
         return response
 
@@ -305,35 +304,128 @@ def test_single_question():
 
     # Table content for multi-table association
     table_content = """
-    ## departments
-    | department_id | department_name | location    | manager_id |
-    |---------------|----------------|-------------|------------|
-    | 101           | R & D Department | Beijing     | 1          |
-    | 102           | Sales Department | Shanghai    | 3          |
-    | 103           | Finance Department | Guangzhou  | 5          |
+    #airline
 
-    ## projects
-    | project_id | project_name | department_id | start_date  | end_date    | budget  |
-    |------------|--------------|---------------|-------------|-------------|---------|
-    | 201        | Product A Development | 101           | 2023-01-15  | 2023-06-30  | 500  |
-    | 202        | Marketing Promotion | 102           | 2023-02-01  | 2023-04-30    | 300  |
-    | 203        | Finance System Upgrade | 103           | 2023-03-10  | 2023-05-15 | 250  |
-    | 204        | Product B Development | 101           | 2023-04-01  | 2023-09-30  | 600  |
+    ## Air_Carriers
+
+    Code,Description
+    19393,Southwest Airlines Co.: WN
+    19687,Horizon Air: QX
+    19790,Delta Air Lines Inc.: DL
+    19805,American Airlines Inc.: AA
+    19930,Alaska Airlines Inc.: AS
+    19977,United Air Lines Inc.: UA
+    20046,Air Wisconsin Airlines Corp: ZW
+    20304,SkyWest Airlines Inc.: OO
+    20363,Endeavor Air Inc.: 9E
+    20368,Allegiant Air: G4
+    20378,Mesa Airlines Inc.: YV
+    20397,PSA Airlines Inc.: OH
+    20398,Envoy Air: MQ
+    20409,JetBlue Airways: B6
+    20416,Spirit Air Lines: NK
+    20452,Republic Airline: YX
+
+
+    ## Airports
+
+    Code,Description
+    ABQ,"Albuquerque, NM: Albuquerque International Sunport"
+    ATL,"Atlanta, GA: Hartsfield-Jackson Atlanta International"
+    BUF,"Buffalo, NY: Buffalo Niagara International"
+    BWI,"Baltimore, MD: Baltimore/Washington International Thurgood Marshall"
+    CLT,"Charlotte, NC: Charlotte Douglas International"
+    CVG,"Cincinnati, OH: Cincinnati/Northern Kentucky International"
+    DAL,"Dallas, TX: Dallas Love Field"
+    DTW,"Detroit, MI: Detroit Metro Wayne County"
+    FLL,"Fort Lauderdale, FL: Fort Lauderdale-Hollywood International"
+    FNT,"Flint, MI: Bishop International"
+    GEG,"Spokane, WA: Spokane International"
+    GSO,"Greensboro/High Point, NC: Piedmont Triad International"
+    IAD,"Washington, DC: Washington Dulles International"
+    IAH,"Houston, TX: George Bush Intercontinental/Houston"
+    IND,"Indianapolis, IN: Indianapolis International"
+    JAX,"Jacksonville, FL: Jacksonville International"
+    LAS,"Las Vegas, NV: McCarran International"
+    LGA,"New York, NY: LaGuardia"
+    MCO,"Orlando, FL: Orlando International"
+    MEM,"Memphis, TN: Memphis International"
+    MHT,"Manchester, NH: Manchester-Boston Regional"
+    MKE,"Milwaukee, WI: General Mitchell International"
+    MSN,"Madison, WI: Dane County Regional-Truax Field"
+    MYR,"Myrtle Beach, SC: Myrtle Beach International"
+    OAJ,"Jacksonville/Camp Lejeune, NC: Albert J Ellis"
+    OAK,"Oakland, CA: Metropolitan Oakland International"
+    ORD,"Chicago, IL: Chicago O'Hare International"
+    PDX,"Portland, OR: Portland International"
+    RDU,"Raleigh/Durham, NC: Raleigh-Durham International"
+    SFO,"San Francisco, CA: San Francisco International"
+    SJC,"San Jose, CA: Norman Y. Mineta San Jose International"
+    ANC,"Anchorage, AK: Ted Stevens Anchorage International"
+    BDL,"Hartford, CT: Bradley International"
+    BUR,"Burbank, CA: Bob Hope"
+    FAY,"Fayetteville, NC: Fayetteville Regional/Grannis Field"
+    JFK,"New York, NY: John F. Kennedy International"
+    LBB,"Lubbock, TX: Lubbock Preston Smith International"
+    MAF,"Midland/Odessa, TX: Midland International Air and Space Port"
+    PGV,"Greenville, NC: Pitt Greenville"
+    PHL,"Philadelphia, PA: Philadelphia International"
+    PHX,"Phoenix, AZ: Phoenix Sky Harbor International"
+    PIE,"St. Petersburg, FL: St Pete Clearwater International"
+    SEA,"Seattle, WA: Seattle/Tacoma International"
+    VPS,"Valparaiso, FL: Eglin AFB Destin Fort Walton Beach"
+
+
+    ## Airlines
+
+    FL_DATE,OP_CARRIER_AIRLINE_ID,TAIL_NUM,OP_CARRIER_FL_NUM,ORIGIN_AIRPORT_ID,ORIGIN_AIRPORT_SEQ_ID,ORIGIN_CITY_MARKET_ID,ORIGIN,DEST_AIRPORT_ID,DEST_AIRPORT_SEQ_ID,DEST_CITY_MARKET_ID,DEST,CRS_DEP_TIME,DEP_TIME,DEP_DELAY,DEP_DELAY_NEW,ARR_TIME,ARR_DELAY,ARR_DELAY_NEW,CANCELLED,CANCELLATION_CODE,CRS_ELAPSED_TIME,ACTUAL_ELAPSED_TIME,CARRIER_DELAY,WEATHER_DELAY,NAS_DELAY,SECURITY_DELAY,LATE_AIRCRAFT_DELAY
+    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,
+    2018/8/1,20378,N86324,6222,15624,1562404,31504,VPS,12266,1226603,31453,IAH,900,854.0,-6.0,0.0,1059.0,11.0,11.0,0,,108,125.0,,,,,
+    2018/8/2,19393,N8511K,738,10821,1082106,30852,BWI,11697,1169706,32467,FLL,1945,,,,,,,1,B,155,,,,,,
+    2018/8/4,19393,N438WN,5784,13204,1320402,31454,MCO,12339,1233904,32337,IND,2025,2036.0,11.0,11.0,2244.0,-1.0,0.0,0,,140,128.0,,,,,
+    2018/8/5,20452,N857RW,3629,13930,1393006,30977,ORD,11193,1119302,33105,CVG,910,905.0,-5.0,0.0,1116.0,-13.0,0.0,0,,79,71.0,,,,,
+    2018/8/5,20409,N947JB,577,11697,1169706,32467,FLL,14771,1477104,32457,SFO,906,940.0,34.0,34.0,1241.0,36.0,36.0,0,,359,361.0,34.0,0.0,2.0,0.0,0.0
+    2018/8/7,19393,N7724A,945,14492,1449202,34492,RDU,10821,1082106,30852,BWI,1030,1025.0,-5.0,0.0,1132.0,-3.0,0.0,0,,65,67.0,,,,,
+    2018/8/8,19393,N276WN,2545,13158,1315805,33158,MAF,11259,1125903,30194,DAL,600,557.0,-3.0,0.0,703.0,-7.0,0.0,0,,70,66.0,,,,,
+    2018/8/10,20397,N505AE,5690,11057,1105703,31057,CLT,13485,1348502,33485,MSN,1427,1424.0,-3.0,0.0,1515.0,-18.0,0.0,0,,126,111.0,,,,,
+    2018/8/10,19687,N445QX,2368,14747,1474703,30559,SEA,11884,1188402,31884,GEG,725,724.0,-1.0,0.0,823.0,1.0,1.0,0,,57,59.0,,,,,
+    2018/8/12,20363,N313PQ,4058,10397,1039707,30397,ATL,13795,1379502,33795,OAJ,2116,2112.0,-4.0,0.0,2235.0,-10.0,0.0,0,,89,83.0,,,,,
+    2018/8/15,19977,N33266,2103,12266,1226603,31453,IAH,13204,1320402,31454,MCO,2003,2000.0,-3.0,0.0,2310.0,-15.0,0.0,0,,142,130.0,,,,,
+    2018/8/15,20304,N814SK,4709,10529,1052906,30529,BDL,14492,1449202,34492,RDU,630,626.0,-4.0,0.0,801.0,-17.0,0.0,0,,108,95.0,,,,,
+    2018/8/16,19393,N440LV,1672,10821,1082106,30852,BWI,13296,1329604,30721,MHT,730,724.0,-6.0,0.0,832.0,-18.0,0.0,0,,80,68.0,,,,,
+    2018/8/16,20363,N197PQ,3311,10792,1079206,30792,BUF,12953,1295304,31703,LGA,1219,1215.0,-4.0,0.0,1324.0,-16.0,0.0,0,,81,69.0,,,,,
+    2018/8/17,20409,N651JB,47,10299,1029906,30299,ANC,14057,1405702,34057,PDX,2359,2349.0,-10.0,0.0,411.0,-23.0,0.0,0,,215,202.0,,,,,
+    2018/8/17,19805,N986NN,2310,13930,1393006,30977,ORD,14831,1483106,32457,SJC,1725,1725.0,0.0,0.0,1959.0,5.0,5.0,0,,269,274.0,,,,,
+    2018/8/19,20368,302NV,938,14112,1411206,33195,PIE,13342,1334207,33342,MKE,740,735.0,-5.0,0.0,921.0,-2.0,0.0,0,,163,166.0,,,,,
+    2018/8/19,20046,N424AW,3922,11641,1164102,31641,FAY,12264,1226402,30852,IAD,1930,1937.0,7.0,7.0,2046.0,-9.0,0.0,0,,85,69.0,,,,,
+    2018/8/22,20363,N133EV,5140,12478,1247805,31703,JFK,12451,1245102,31136,JAX,815,809.0,-6.0,0.0,1056.0,3.0,3.0,0,,158,167.0,,,,,
+    2018/8/22,20452,N132HQ,4646,14100,1410005,34100,PHL,13244,1324402,33244,MEM,835,831.0,-4.0,0.0,1019.0,-3.0,0.0,0,,167,168.0,,,,,
+    2018/8/23,19930,N531AS,796,14747,1474703,30559,SEA,11433,1143302,31295,DTW,2355,25.0,30.0,30.0,738.0,32.0,32.0,0,,251,253.0,30.0,0.0,2.0,0.0,0.0
+    2018/8/23,19790,N960DL,942,10397,1039707,30397,ATL,11995,1199502,31995,GSO,816,814.0,-2.0,0.0,913.0,-17.0,0.0,0,,74,59.0,,,,,
+    2018/8/24,19393,N733SA,1907,12889,1288903,32211,LAS,10140,1014005,30140,ABQ,2105,2100.0,-5.0,0.0,2323.0,-12.0,0.0,0,,90,83.0,,,,,
+    2018/8/24,19393,N8544Z,1564,14107,1410702,30466,PHX,10792,1079206,30792,BUF,1715,1713.0,-2.0,0.0,1.0,-14.0,0.0,0,,240,228.0,,,,,
+    2018/8/25,19790,N337DN,1546,14107,1410702,30466,PHX,10397,1039707,30397,ATL,1015,1011.0,-4.0,0.0,1642.0,-23.0,0.0,0,,230,211.0,,,,,
+    2018/8/25,20416,N517NK,717,14100,1410005,34100,PHL,13577,1357702,31135,MYR,815,801.0,-14.0,0.0,933.0,-17.0,0.0,0,,95,92.0,,,,,
+    2018/8/26,19930,N284AK,686,14057,1405702,34057,PDX,13930,1393006,30977,ORD,700,656.0,-4.0,0.0,1225.0,-34.0,0.0,0,,239,209.0,,,,,
+    2018/8/28,20397,N218PS,5116,14092,1409205,34092,PGV,11057,1105703,31057,CLT,533,524.0,-9.0,0.0,624.0,-27.0,0.0,0,,78,60.0,,,,,
+    2018/8/30,19393,N765SW,957,10800,1080003,32575,BUR,13796,1379608,32457,OAK,2120,2150.0,30.0,30.0,2254.0,19.0,19.0,0,,75,64.0,0.0,0.0,0.0,0.0,19.0
+    2018/8/31,19805,N540UW,2052,13930,1393006,30977,ORD,11057,1105703,31057,CLT,724,718.0,-6.0,0.0,1004.0,-20.0,0.0,0,,120,106.0,,,,,
+    2018/8/31,19393,N265WN,207,12896,1289607,32896,LBB,12889,1288903,32211,LAS,1720,1714.0,-6.0,0.0,1721.0,-9.0,0.0,0,,130,127.0,,,,,
     """
 
     # Question for multi-table association
     # question = "What is the total budget of the projects managed by the R & D Department? Choices:\n A. 1100\nB. 670\nC. 500 \nD. 1650"
-    question = "Which project is managed by the Sales Department? Choices:\n A. Product A Development\nB. Marketing Promotion\nC. Finance System Upgrade \nD. Product B Development"
+    question = "How many airlines land in Buffalo, NY: Buffalo Niagara International?:\n A. 1 \nB. 2\nC. 0 \nD. 3assistant"
 
 
     '''
     正确答案
-    是C
+    是A
     '''
 
     # Test three different question - asking methods
     for prompt_type in ["default", "cot", "retrace_table"]:
-        print(f"\n===== Question - asking method: {prompt_type} =====")
+        # print(f"\n===== Question - asking method: {prompt_type} =====")
         response = evaluator.answer_question(table_content, question, "", prompt_type=prompt_type)
         print("Answer:", response)
 
