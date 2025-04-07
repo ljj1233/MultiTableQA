@@ -48,7 +48,7 @@ class TableLlamaAPI:
         
         return prompt_template
 
-    def chat(self, message, temperature=0.7, max_tokens=2048):
+    def chat(self, message, temperature=0.7, max_tokens=2048,top_p=0.8):
         """
         使用 API 进行对话
         
@@ -75,6 +75,7 @@ class TableLlamaAPI:
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
+                top_p =top_p,
                 stream=False
             )
             return response.choices[0].message.content
