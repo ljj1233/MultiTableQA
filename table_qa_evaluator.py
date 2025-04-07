@@ -230,7 +230,7 @@ class TableQAEvaluator:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="表格问答评估工具")
+    parser = argparse.ArgumentParser(description="多表格问答评估")
     parser.add_argument("--model_path", type=str, default="chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct", 
                         help="模型路径")
     parser.add_argument("--db_root", type=str, required=True, help="数据库根目录")
