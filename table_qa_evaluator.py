@@ -22,7 +22,7 @@ class TableQAEvaluator:
         self.device = device
         self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 10000  # 增加token预算以处理更多表格数据
+        self.table_token_budget = 5000  # 增加token预算以处理更多表格数据
         
         apply_table_function()
 
@@ -55,8 +55,8 @@ class TableQAEvaluator:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         # 初始化生成配置
         self.generation_config = GenerationConfig(
-            num_beams=5,
-            max_length=60000,
+            num_beams=3,
+            max_length=20000,
             early_stopping=True,  # 改为 True，当达到停止条件时提前结束生成
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
@@ -65,19 +65,18 @@ class TableQAEvaluator:
             no_repeat_ngram_size=3,  # 禁止重复的n-gram大小
             length_penalty=1.0,  # 长度惩罚，小于1会倾向生成更短的回答
             temperature=0.1,  # 控制生成的随机性，越小越保守
-            top_p=0.7,  # 控制采样范围，越小生成越保守
-            top_k=10,  # 只保留概率最高的前k个token
+            top_p=0.5,  # 控制采样范围，越小生成越保守
             do_sample=True,
             )
-        print(f'self.generation_config.max_length: {self.generation_config.max_length}')
-        print(f'self.model.config.max_position_embeddings: {self.model.config.max_position_embeddings}')
+        # print(f'self.generation_config.max_length: {self.generation_config.max_length}')
+        # print(f'self.model.config.max_position_embeddings: {self.model.config.max_position_embeddings}')
 
         apply_table_llama(
                 self.model,
                 starting_layer=7,
                 ending_layer=12,
                 entropy_threshold=0.9,
-                retracing_ratio=0.1
+                retracing_ratio=0.05
             )
         print(f"模型 {model_path} 已加载完成")
         
@@ -180,10 +179,10 @@ class TableQAEvaluator:
                 with sqlite3.connect(result_path) as conn:
                     cursor = conn.cursor()
                     # 获取当前数据库和规模的统计信息
-                    cursor.execute("""
+                    cursor.execute(f"""
                         SELECT COUNT(*) as total,
                                SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) as correct
-                        FROM results 
+                        FROM {dbn} 
                         WHERE scale = ? AND model = ?
                     """, (current_scale, model_name))
                     stats = cursor.fetchone()
@@ -292,11 +291,7 @@ class TableQAEvaluator:
         outputs = self.model.generate(
             **inputs,
             generation_config=self.generation_config,
-            max_new_tokens=6000,
-            # 移除这些参数，因为已经在generation_config中设置
-            # temperature=0.7,
-            # top_p=0.7,
-            # do_sample=True,
+            max_new_tokens=10000,
             table_token=table_token_ids if use_table_token else None,
             tokenizer=self.tokenizer if use_table_token else None
         )
@@ -356,8 +351,7 @@ def main():
                 layer.mlp.apply_table_injection = False
     
     # 存储所有scale的评估结果
-    # 初始化存储所有scale结果的字典
-    all_results = {}
+    all_results = {'markdown': {}, 'csv': {}}
     
     # 对每个scale进行评估
     for scale in args.scale:
@@ -368,49 +362,60 @@ def main():
         elif scale == "32k":
             time_sleep = 60
         
-        print(f"\n开始评估 scale={scale}")
-        
-        # 运行评估并获取指标
-        metrics = evaluator.run_evaluation(
-            db_root=args.db_root,
-            task_path=args.task_path,
-            result_path=args.result_path.replace('.sqlite', f'_{scale}.sqlite'),
-            dataset_name=args.dataset,
-            scale=scale,
-            markdown=args.markdown,
-            db_limit=args.db_limit,
-            sample_limit=args.sample_limit,
-            question_limit=args.question_limit,
-            time_sleep=time_sleep or args.time_sleep,
-            prompt_type=args.prompt_type
-        )
-        
-        all_results[scale] = metrics
+        # 分别评估 markdown 和非 markdown 格式
+        for format_type in ['markdown', 'csv']:
+            is_markdown = format_type == 'markdown'
+            print(f"\n开始评估 scale={scale}, format={format_type}")
+            
+            # 修改结果文件路径以区分格式
+            current_result_path = args.result_path.replace(
+                '.sqlite', 
+                f'_{scale}_{format_type}.sqlite'
+            )
+            
+            # 运行评估并获取指标
+            metrics = evaluator.run_evaluation(
+                db_root=args.db_root,
+                task_path=args.task_path,
+                result_path=current_result_path,
+                dataset_name=args.dataset,
+                scale=scale,
+                markdown=is_markdown,   
+                db_limit=args.db_limit,
+                sample_limit=args.sample_limit,
+                question_limit=args.question_limit,
+                time_sleep=time_sleep or args.time_sleep,
+                prompt_type=args.prompt_type
+            )
+            
+            all_results[format_type][scale] = metrics
 
-    # 输出所有scale的评估结果总结
-    print("\n=== 评估结果总结 ===")
-    total_correct = 0
-    total_questions = 0
-    
-    for scale, metrics in all_results.items():
-        print(f"\nScale: {scale}")
-        print(f"总问题数: {metrics['total_count']}")
-        print(f"正确回答数: {metrics['correct_count']}")
-        print(f"准确率: {metrics['accuracy']:.2f}%")
+    # 分别输出 markdown 和非 markdown 的评估结果
+    for format_type in ['markdown', 'csv']:
+        print(f"\n=== {format_type} 格式评估结果总结 ===")
+        total_correct = 0
+        total_questions = 0
         
-        # 累计总数
-        total_correct += metrics['correct_count']
-        total_questions += metrics['total_count']
-    
-    # 计算整体准确率
-    overall_accuracy = (total_correct / total_questions * 100) if total_questions > 0 else 0
-    print("\n=== 整体统计 ===")
-    print(f"总问题数: {total_questions}")
-    print(f"总正确数: {total_correct}")
-    print(f"整体准确率: {overall_accuracy:.2f}%")
-    print("各规模准确率:")
-    for sub_scale, acc in metrics['scale_accuracy'].items():
-        print(f"  {sub_scale} 规模: {acc:.2f}%")
+        for scale, metrics in all_results[format_type].items():
+            print(f"\nScale: {scale}")
+            print(f"总问题数: {metrics['total_count']}")
+            print(f"正确回答数: {metrics['correct_count']}")
+            print(f"准确率: {metrics['accuracy']:.2f}%")
+            
+            # 累计总数
+            total_correct += metrics['correct_count']
+            total_questions += metrics['total_count']
+        
+        # 计算整体准确率
+        overall_accuracy = (total_correct / total_questions * 100) if total_questions > 0 else 0
+        print(f"\n=== {format_type} 格式整体统计 ===")
+        print(f"总问题数: {total_questions}")
+        print(f"总正确数: {total_correct}")
+        print(f"整体准确率: {overall_accuracy:.2f}%")
+        print(f"{format_type} 格式各规模准确率:")
+        for scale, metrics in all_results[format_type].items():
+            for sub_scale, acc in metrics['scale_accuracy'].items():
+                print(f"  {sub_scale} 规模: {acc:.2f}%")
     print(f"\n准确率 (ACC): {metrics['accuracy']:.2f}%")
     print(f"错误率: {metrics['error_rate']:.2f}%")
         
