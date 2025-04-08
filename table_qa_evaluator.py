@@ -127,6 +127,12 @@ class TableQAEvaluator:
         # 创建一个包装函数，将prompt_type传递给answer_question
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
             return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type)
+        
+        # 初始化评估指标
+        total_questions = 0
+        correct_answers = 0
+        total_errors = 0
+        
         database_list = list(dataDict.keys())
         for dbn in tqdm(database_list, desc="database_list"):
             # 根据不同规模设置等待时间
@@ -160,8 +166,45 @@ class TableQAEvaluator:
                     func=wrapped_answer_func,
                     timeSleep=current_time_sleep
                 )
-            
+                
+                # 从结果数据库中统计指标
+                with sqlite3.connect(result_path) as conn:
+                    cursor = conn.cursor()
+                    # 获取当前scale和数据库的统计信息
+                    cursor.execute(f"""
+                        SELECT COUNT(*) as total,
+                               SUM(correct) as correct,
+                               SUM(CASE WHEN error != '' THEN 1 ELSE 0 END) as errors
+                        FROM {dbn}
+                        WHERE scale = ? AND model = ?
+                    """, (current_scale, model_name))
+                    
+                    stats = cursor.fetchone()
+                    if stats:
+                        total_questions += stats[0]
+                        correct_answers += stats[1]
+                        total_errors += stats[2]
+        
+        # 计算并输出评估指标
+        accuracy = (correct_answers / total_questions * 100) if total_questions > 0 else 0
+        error_rate = (total_errors / total_questions * 100) if total_questions > 0 else 0
+        
+        print("\n=== 评估指标 ===")
+        print(f"总问题数: {total_questions}")
+        print(f"正确回答数: {correct_answers}")
+        print(f"错误数: {total_errors}")
+        print(f"准确率 (ACC): {accuracy:.2f}%")
+        print(f"错误率: {error_rate:.2f}%")
         print(f"评估完成，结果已保存到 {result_path}")
+        
+        # 返回评估指标
+        return {
+            "total_questions": total_questions,
+            "correct_answers": correct_answers,
+            "total_errors": total_errors,
+            "accuracy": accuracy,
+            "error_rate": error_rate
+        }
 
 
 
@@ -279,6 +322,9 @@ def main():
             if hasattr(layer.mlp, 'apply_table_injection'):
                 layer.mlp.apply_table_injection = False
     
+    # 存储所有scale的评估结果
+    all_results = {}
+    
     # 对每个scale进行评估
     for scale in args.scale:
         # 根据scale设置time_sleep
@@ -287,24 +333,33 @@ def main():
             time_sleep = 30
         elif scale == "32k":
             time_sleep = 60
-            
+        
         print(f"\n开始评估 scale={scale}")
-        # 运行评估
-        evaluator.run_evaluation(
+        
+        # 运行评估并获取指标
+        metrics = evaluator.run_evaluation(
             db_root=args.db_root,
             task_path=args.task_path,
-            result_path=args.result_path.replace('.sqlite', f'_{scale}.sqlite'),  
+            result_path=args.result_path.replace('.sqlite', f'_{scale}.sqlite'),
             dataset_name=args.dataset,
             scale=scale,
             markdown=args.markdown,
             db_limit=args.db_limit,
             sample_limit=args.sample_limit,
             question_limit=args.question_limit,
-            time_sleep=time_sleep or args.time_sleep,   
+            time_sleep=time_sleep or args.time_sleep,
             prompt_type=args.prompt_type
         )
+        
+        all_results[scale] = metrics
 
-
+    # 输出所有scale的评估结果总结
+    print("\n=== 评估结果总结 ===")
+    for scale, metrics in all_results.items():
+        print(f"\nScale: {scale}")
+        print(f"准确率 (ACC): {metrics['accuracy']:.2f}%")
+        print(f"错误率: {metrics['error_rate']:.2f}%")
+        
 # Single question test example
 def test_single_question():
     model_path = "chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct"
@@ -389,10 +444,10 @@ def test_single_question():
     ## Airlines
 
     FL_DATE,OP_CARRIER_AIRLINE_ID,TAIL_NUM,OP_CARRIER_FL_NUM,ORIGIN_AIRPORT_ID,ORIGIN_AIRPORT_SEQ_ID,ORIGIN_CITY_MARKET_ID,ORIGIN,DEST_AIRPORT_ID,DEST_AIRPORT_SEQ_ID,DEST_CITY_MARKET_ID,DEST,CRS_DEP_TIME,DEP_TIME,DEP_DELAY,DEP_DELAY_NEW,ARR_TIME,ARR_DELAY,ARR_DELAY_NEW,CANCELLED,CANCELLATION_CODE,CRS_ELAPSED_TIME,ACTUAL_ELAPSED_TIME,CARRIER_DELAY,WEATHER_DELAY,NAS_DELAY,SECURITY_DELAY,LATE_AIRCRAFT_DELAY
-    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,,
-    2018/8/1,20378,N86324,6222,15624,1562404,31504,VPS,12266,1226603,31453,IAH,900,854.0,-6.0,0.0,1059.0,11.0,11.0,0,,108,125.0,,,,,,
+    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,,,,,
+    2018/8/1,20378,N86324,6222,15624,1562404,31504,VPS,12266,1226603,31453,IAH,900,854.0,-6.0,0.0,1059.0,11.0,11.0,0,,108,125.0,,,,,,,,
     2018/8/2,19393,N8511K,738,10821,1082106,30852,BWI,11697,1169706,32467,FLL,1945,,,,,,,1,B,155,,,,,,
-    2018/8/4,19393,N438WN,5784,13204,1320402,31454,MCO,12339,1233904,32337,IND,2025,2036.0,11.0,11.0,2244.0,-1.0,0.0,0,,140,128.0,,,,,,
+    2018/8/4,19393,N438WN,5784,13204,1320402,31454,MCO,12339,1233904,32337,IND,2025,2036.0,11.0,11.0,2244.0,-1.0,0.0,0,,140,128.0,,,,,,,
     2018/8/5,20452,N857RW,3629,13930,1393006,30977,ORD,11193,1119302,33105,CVG,910,905.0,-5.0,0.0,1116.0,-13.0,0.0,0,,79,71.0,,,,,,
     2018/8/5,20409,N947JB,577,11697,1169706,32467,FLL,14771,1477104,32457,SFO,906,940.0,34.0,34.0,1241.0,36.0,36.0,0,,359,361.0,34.0,0.0,2.0,0.0,0.0
     2018/8/7,19393,N7724A,945,14492,1449202,34492,RDU,10821,1082106,30852,BWI,1030,1025.0,-5.0,0.0,1132.0,-3.0,0.0,0,,65,67.0,,,,,,
