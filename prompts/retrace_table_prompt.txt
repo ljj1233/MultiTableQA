@@ -1,8 +1,6 @@
-
-Please carefully analyze the table data and answer the following question:
-
+Analyze the provided table data carefully and answer the subsequent question.
+Table data:
 {db_str}
-
+Question:
 {question}
-
-This question has only one correct answer. Please break down the question, evaluate each option, and explain why it is correct or incorrect. Conclude with your final choice on a new line formatted as `Answer: A/B/C/D`.
+This question has a single correct answer. Decompose the question, assess each option, and explain the correctness or incorrectness of each. Conclude with your final answer on a new line as Answer: A/B/C/D.
