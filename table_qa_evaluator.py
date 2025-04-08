@@ -56,10 +56,17 @@ class TableQAEvaluator:
         # 初始化生成配置
         self.generation_config = GenerationConfig(
             num_beams=5,
-            max_length= 60000,
-            early_stopping=False,
+            max_length=60000,
+            early_stopping=True,  # 改为 True，当达到停止条件时提前结束生成
             eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id
+            pad_token_id=self.tokenizer.pad_token_id,
+            # 添加以下参数来控制生成质量
+            repetition_penalty=1.2,  # 增加重复惩罚，范围通常在1.0-1.5
+            no_repeat_ngram_size=3,  # 禁止重复的n-gram大小
+            length_penalty=1.0,  # 长度惩罚，小于1会倾向生成更短的回答
+            temperature=0.7,  # 控制生成的随机性，越小越保守
+            top_p=0.9,  # 控制采样范围，越小生成越保守
+            top_k=50,  # 只保留概率最高的前k个token
         )
         print(f'self.generation_config.max_length: {self.generation_config.max_length}')
         print(f'self.model.config.max_position_embeddings: {self.model.config.max_position_embeddings}')
@@ -68,7 +75,7 @@ class TableQAEvaluator:
                 self.model,
                 starting_layer=9,
                 ending_layer=12,
-                entropy_threshold=0.85,
+                entropy_threshold=0.9,
                 retracing_ratio=0.05
             )
         print(f"模型 {model_path} 已加载完成")
@@ -261,10 +268,11 @@ class TableQAEvaluator:
         outputs = self.model.generate(
             **inputs,
             generation_config=self.generation_config,
-            max_new_tokens=6000, 
-            temperature=0.7,
-            top_p=0.7,
-            do_sample=True,
+            max_new_tokens=6000,
+            # 移除这些参数，因为已经在generation_config中设置
+            # temperature=0.7,
+            # top_p=0.7,
+            # do_sample=True,
             table_token=table_token_ids if use_table_token else None,
             tokenizer=self.tokenizer if use_table_token else None
         )
@@ -445,7 +453,7 @@ def test_single_question():
     ## Airlines
 
     FL_DATE,OP_CARRIER_AIRLINE_ID,TAIL_NUM,OP_CARRIER_FL_NUM,ORIGIN_AIRPORT_ID,ORIGIN_AIRPORT_SEQ_ID,ORIGIN_CITY_MARKET_ID,ORIGIN,DEST_AIRPORT_ID,DEST_AIRPORT_SEQ_ID,DEST_CITY_MARKET_ID,DEST,CRS_DEP_TIME,DEP_TIME,DEP_DELAY,DEP_DELAY_NEW,ARR_TIME,ARR_DELAY,ARR_DELAY_NEW,CANCELLED,CANCELLATION_CODE,CRS_ELAPSED_TIME,ACTUAL_ELAPSED_TIME,CARRIER_DELAY,WEATHER_DELAY,NAS_DELAY,SECURITY_DELAY,LATE_AIRCRAFT_DELAY
-    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,,,,,,
+    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,,,,,,,
     2018/8/1,20378,N86324,6222,15624,1562404,31504,VPS,12266,1226603,31453,IAH,900,854.0,-6.0,0.0,1059.0,11.0,11.0,0,,108,125.0,,,,,,,,
     2018/8/2,19393,N8511K,738,10821,1082106,30852,BWI,11697,1169706,32467,FLL,1945,,,,,,,1,B,155,,,,,,
     2018/8/4,19393,N438WN,5784,13204,1320402,31454,MCO,12339,1233904,32337,IND,2025,2036.0,11.0,11.0,2244.0,-1.0,0.0,0,,140,128.0,,,,,,,
