@@ -176,3 +176,4 @@ cython_debug/
 
 #file
 chanage_model/*
+dataset/results/*

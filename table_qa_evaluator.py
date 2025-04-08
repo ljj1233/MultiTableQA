@@ -21,7 +21,7 @@ class TableQAEvaluator:
         self.device = device
         self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 4096  # 增加token预算以处理更多表格数据
+        self.table_token_budget = 4096   
         
         apply_table_function()
 
@@ -49,22 +49,19 @@ class TableQAEvaluator:
             ).to(device)
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.tokenizer.pad_token = self.tokenizer.eos_token   
         
         # 初始化生成配置
         self.generation_config = GenerationConfig(
             num_beams=5,
-            no_repeat_ngram_size=2,
-            early_stopping=False,
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id
         )
         apply_table_llama(
                 self.model,
-                starting_layer=8,
+                starting_layer=7,
                 ending_layer=12,
                 entropy_threshold=0.9,
-                retracing_ratio=0.01
+                retracing_ratio=0.05
             )
         print(f"模型 {model_path} 已加载完成")
         
@@ -168,7 +165,7 @@ class TableQAEvaluator:
         """
         prompt_template = self._load_prompt_templates(prompt_type)
         full_prompt = prompt_template.format(db_str=db_str, question=question) # Use original db_str in prompt
-
+        print(f'prompt_type: {prompt_type}')
         if choices_str and "{choices_str}" not in prompt_template:
             full_prompt += f"\n\n{choices_str}"
         elif choices_str:
@@ -194,24 +191,27 @@ class TableQAEvaluator:
         use_table_token = prompt_type == "retrace_table"
         if use_table_token:
              # 使用表格处理器处理表格内容
-             table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
+            table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
 
-             if table_token_ids is not None:
-                 table_token_ids = table_token_ids.to(self.device)
+            if table_token_ids is not None:
+                table_token_ids = table_token_ids.to(self.device)
 
 
         # --- Generate Answer ---
         # Ensure table_token is handled correctly by your modified model.generate
+        # 修改生成参数
         outputs = self.model.generate(
-            **inputs,
-            generation_config=self.generation_config,
-            max_new_tokens=5192, 
-            temperature=0.85,
-            top_p=0.8,
-            do_sample=True,
-            repetition_penalty=1.0,
-            table_token=table_token_ids if use_table_token else None,
-            tokenizer=self.tokenizer if use_table_token else None
+        **inputs,
+        generation_config=self.generation_config,
+        max_new_tokens=5192, 
+        temperature=0.85,
+        top_p=0.8,
+        do_sample=True,
+        repetition_penalty=1.2,      # 添加重复惩罚
+        no_repeat_ngram_size=3,      # 禁止重复的n-gram大小
+        length_penalty=1.0,          # 长度惩罚
+        table_token=table_token_ids if use_table_token else None,
+        tokenizer=self.tokenizer if use_table_token else None
         )
 
         # Decode the *generated part* only
@@ -245,7 +245,7 @@ def main():
     parser.add_argument("--sample_limit", type=int, default=5, help="每个数据库的样本数量限制")
     parser.add_argument("--question_limit", type=int, default=5, help="每个样本的问题数量限制")
     parser.add_argument("--time_sleep", type=float, default=0, help="每次评估间隔时间")
-    parser.add_argument("--prompt_type", type=str, default="default", 
+    parser.add_argument("--prompt_type", type=str, default="retrace_table", 
                         choices=["default", "cot", "retrace_table"],
                         help="提示类型: default(原始提问), cot(思维链), retrace_table(表格增强)")
     parser.add_argument("--device", type=str, default="cuda:0", help="指定使用的设备，例如 'cuda:0'")
@@ -379,11 +379,11 @@ def test_single_question():
     ## Airlines
 
     FL_DATE,OP_CARRIER_AIRLINE_ID,TAIL_NUM,OP_CARRIER_FL_NUM,ORIGIN_AIRPORT_ID,ORIGIN_AIRPORT_SEQ_ID,ORIGIN_CITY_MARKET_ID,ORIGIN,DEST_AIRPORT_ID,DEST_AIRPORT_SEQ_ID,DEST_CITY_MARKET_ID,DEST,CRS_DEP_TIME,DEP_TIME,DEP_DELAY,DEP_DELAY_NEW,ARR_TIME,ARR_DELAY,ARR_DELAY_NEW,CANCELLED,CANCELLATION_CODE,CRS_ELAPSED_TIME,ACTUAL_ELAPSED_TIME,CARRIER_DELAY,WEATHER_DELAY,NAS_DELAY,SECURITY_DELAY,LATE_AIRCRAFT_DELAY
-    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,
-    2018/8/1,20378,N86324,6222,15624,1562404,31504,VPS,12266,1226603,31453,IAH,900,854.0,-6.0,0.0,1059.0,11.0,11.0,0,,108,125.0,,,,,
+    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,,
+    2018/8/1,20378,N86324,6222,15624,1562404,31504,VPS,12266,1226603,31453,IAH,900,854.0,-6.0,0.0,1059.0,11.0,11.0,0,,108,125.0,,,,,,
     2018/8/2,19393,N8511K,738,10821,1082106,30852,BWI,11697,1169706,32467,FLL,1945,,,,,,,1,B,155,,,,,,
-    2018/8/4,19393,N438WN,5784,13204,1320402,31454,MCO,12339,1233904,32337,IND,2025,2036.0,11.0,11.0,2244.0,-1.0,0.0,0,,140,128.0,,,,,
-    2018/8/5,20452,N857RW,3629,13930,1393006,30977,ORD,11193,1119302,33105,CVG,910,905.0,-5.0,0.0,1116.0,-13.0,0.0,0,,79,71.0,,,,,
+    2018/8/4,19393,N438WN,5784,13204,1320402,31454,MCO,12339,1233904,32337,IND,2025,2036.0,11.0,11.0,2244.0,-1.0,0.0,0,,140,128.0,,,,,,
+    2018/8/5,20452,N857RW,3629,13930,1393006,30977,ORD,11193,1119302,33105,CVG,910,905.0,-5.0,0.0,1116.0,-13.0,0.0,0,,79,71.0,,,,,,
     2018/8/5,20409,N947JB,577,11697,1169706,32467,FLL,14771,1477104,32457,SFO,906,940.0,34.0,34.0,1241.0,36.0,36.0,0,,359,361.0,34.0,0.0,2.0,0.0,0.0
     2018/8/7,19393,N7724A,945,14492,1449202,34492,RDU,10821,1082106,30852,BWI,1030,1025.0,-5.0,0.0,1132.0,-3.0,0.0,0,,65,67.0,,,,,
     2018/8/8,19393,N276WN,2545,13158,1315805,33158,MAF,11259,1125903,30194,DAL,600,557.0,-3.0,0.0,703.0,-7.0,0.0,0,,70,66.0,,,,,

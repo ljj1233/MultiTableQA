@@ -311,7 +311,7 @@ def table_forward(
                 current_table_token = self.layers[0].mlp.table_token.to(input_ids.device)  # Retrieve shared token
                 table_embeds = self.embed_tokens(current_table_token)
                 next_layer_mlp.initialize_table_embedding(table_embeds)
-                # print(f"add table feature to layer {layer_idx}")
+                print(f"add table feature to layer {layer_idx}")
                 next_layer_mlp.adapt_signal = 1
                 next_layer_mlp.retracing_ratio = retracing_ratio
                 
