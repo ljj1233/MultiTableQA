@@ -137,10 +137,10 @@ class TableQAEvaluator:
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
             return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type)
         
-        # 初始化评估指标
+        # 初始化评估指标和结果存储
+        all_results = {}
+        total_correct = 0
         total_questions = 0
-        correct_answers = 0
-        total_errors = 0
         
         database_list = list(dataDict.keys())
         for dbn in tqdm(database_list, desc="database_list"):
@@ -176,29 +176,55 @@ class TableQAEvaluator:
                     timeSleep=current_time_sleep
                 )
                 
+                # 每个数据库和规模评估后，立即统计结果
+                with sqlite3.connect(result_path) as conn:
+                    cursor = conn.cursor()
+                    # 获取当前数据库和规模的统计信息
+                    cursor.execute("""
+                        SELECT COUNT(*) as total,
+                               SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) as correct
+                        FROM results 
+                        WHERE scale = ? AND model = ?
+                    """, (current_scale, model_name))
+                    stats = cursor.fetchone()
+                    if stats:
+                        db_total = stats[0] if stats[0] else 0
+                        db_correct = stats[1] if stats[1] else 0
+                        
+                        # 累计总数
+                        total_questions += db_total
+                        total_correct += db_correct
+                        
+                        # 存储每个数据库和规模的结果
+                        key = f"{dbn}_{current_scale}"
+                        all_results[key] = {
+                            "database": dbn,
+                            "scale": current_scale,
+                            "total": db_total,
+                            "correct": db_correct,
+                            "accuracy": (db_correct / db_total * 100) if db_total > 0 else 0
+                        }
 
-
-
-        with sqlite3.connect(result_path) as conn:
-            cursor = conn.cursor()
-            # 整体准确率
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE correct = 1")
-            correct_count = cursor.fetchone()[0]
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-            total_count = cursor.fetchone()[0]
-            overall_accuracy = correct_count / total_count if total_count > 0 else 0
-
-            scale_accuracy = {}
-            cursor.execute(f"SELECT scale, COUNT(*) FROM {table_name} WHERE correct = 1 GROUP BY scale")
-            for scale, scale_correct_count in cursor.fetchall():
-                cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE scale = ?", (scale,))
-                scale_total_count = cursor.fetchone()[0]
-                scale_accuracy[scale] = scale_correct_count / scale_total_count if scale_total_count > 0 else 0
-
+        # 计算整体准确率
+        overall_accuracy = (total_correct / total_questions * 100) if total_questions > 0 else 0
+        
+        # 按规模统计准确率
+        scale_accuracy = {}
+        for key, result in all_results.items():
+            scale = result["scale"]
+            if scale not in scale_accuracy:
+                scale_accuracy[scale] = {"total": 0, "correct": 0}
+            
+            scale_accuracy[scale]["total"] += result["total"]
+            scale_accuracy[scale]["correct"] += result["correct"]
+        
+        # 计算每个规模的准确率
+        for scale, counts in scale_accuracy.items():
+            scale_accuracy[scale] = (counts["correct"] / counts["total"] * 100) if counts["total"] > 0 else 0
         
         print("\n=== 评估指标 ===")
-        print(f"总问题数: {total_count}")
-        print(f"正确回答数: {correct_count}")
+        print(f"总问题数: {total_questions}")
+        print(f"正确回答数: {total_correct}")
         print(f"整体准确率: {overall_accuracy:.2f}%")
         print("\n各规模准确率:")
         for scale, acc in scale_accuracy.items():
@@ -207,12 +233,10 @@ class TableQAEvaluator:
         
         # 返回所有统计指标
         return {
-            "total_count": total_count,
-            "correct_count": correct_count,
-            "overall_accuracy": overall_accuracy * 100,  # 转换为百分比
-            "scale_accuracy": {
-                scale: acc * 100 for scale, acc in scale_accuracy.items()  # 转换为百分比
-            }
+            "total_count": total_questions,
+            "correct_count": total_correct,
+            "overall_accuracy": overall_accuracy,
+            "scale_accuracy": scale_accuracy
         }
 
 
@@ -384,11 +408,11 @@ def main():
     print(f"总问题数: {total_questions}")
     print(f"总正确数: {total_correct}")
     print(f"整体准确率: {overall_accuracy:.2f}%")
-        print("各规模准确率:")
-        for sub_scale, acc in metrics['scale_accuracy'].items():
-            print(f"  {sub_scale} 规模: {acc:.2f}%")
-        print(f"\n准确率 (ACC): {metrics['accuracy']:.2f}%")
-        print(f"错误率: {metrics['error_rate']:.2f}%")
+    print("各规模准确率:")
+    for sub_scale, acc in metrics['scale_accuracy'].items():
+        print(f"  {sub_scale} 规模: {acc:.2f}%")
+    print(f"\n准确率 (ACC): {metrics['accuracy']:.2f}%")
+    print(f"错误率: {metrics['error_rate']:.2f}%")
         
 # Single question test example
 def test_single_question():
