@@ -21,7 +21,7 @@ class TableQAEvaluator:
         self.device = device
         self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 4096   
+        self.table_token_budget = 10000  # 增加token预算以处理更多表格数据
         
         apply_table_function()
 
@@ -49,28 +49,34 @@ class TableQAEvaluator:
             ).to(device)
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        
+        # self.tokenizer.pad_token = self.tokenizer.eos_token   
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         # 初始化生成配置
         self.generation_config = GenerationConfig(
             num_beams=5,
+            max_length= 60000,
+            early_stopping=False,
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id
         )
+        print(f'self.generation_config.max_length: {self.generation_config.max_length}')
+        print(f'self.model.config.max_position_embeddings: {self.model.config.max_position_embeddings}')
+
         apply_table_llama(
                 self.model,
-                starting_layer=7,
+                starting_layer=9,
                 ending_layer=12,
-                entropy_threshold=0.9,
+                entropy_threshold=0.85,
                 retracing_ratio=0.05
             )
         print(f"模型 {model_path} 已加载完成")
         
         # 初始化表格相关行提取器
-        self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
+        # self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
         
         # 初始化表格处理器
         self.table_processor = SingleTableProcessor(self.tokenizer, self.device, self.table_token_budget)
-
         # self.table_processor = TableProcessor(self.tokenizer, self.relevance_extractor, self.device, self.table_token_budget)
   
 
@@ -165,14 +171,23 @@ class TableQAEvaluator:
         """
         prompt_template = self._load_prompt_templates(prompt_type)
         full_prompt = prompt_template.format(db_str=db_str, question=question) # Use original db_str in prompt
-        print(f'prompt_type: {prompt_type}')
+
         if choices_str and "{choices_str}" not in prompt_template:
             full_prompt += f"\n\n{choices_str}"
         elif choices_str:
             full_prompt = full_prompt.replace("{choices_str}", choices_str)
 
         # Prepare input prompt tokens
-        messages = [{"role": "user", "content": full_prompt}]
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful AI assistant that analyzes tables and answers questions accurately. Always provide your answer in the format 'Answer: X' where X is one of the given choices."
+            },
+            {
+                "role": "user",
+                "content": full_prompt.strip()  # 使用strip()移除多余的空白字符
+            }
+        ]
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -191,33 +206,28 @@ class TableQAEvaluator:
         use_table_token = prompt_type == "retrace_table"
         if use_table_token:
              # 使用表格处理器处理表格内容
-            table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
+             table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
 
-            if table_token_ids is not None:
-                table_token_ids = table_token_ids.to(self.device)
+             if table_token_ids is not None:
+                 table_token_ids = table_token_ids.to(self.device)
 
 
         # --- Generate Answer ---
         # Ensure table_token is handled correctly by your modified model.generate
-        # 修改生成参数
         outputs = self.model.generate(
-        **inputs,
-        generation_config=self.generation_config,
-        max_new_tokens=5192, 
-        temperature=0.85,
-        top_p=0.8,
-        do_sample=True,
-        repetition_penalty=1.2,      # 添加重复惩罚
-        no_repeat_ngram_size=3,      # 禁止重复的n-gram大小
-        length_penalty=1.0,          # 长度惩罚
-        table_token=table_token_ids if use_table_token else None,
-        tokenizer=self.tokenizer if use_table_token else None
+            **inputs,
+            generation_config=self.generation_config,
+            max_new_tokens=6000, 
+            temperature=0.7,
+            top_p=0.7,
+            do_sample=True,
+            table_token=table_token_ids if use_table_token else None,
+            tokenizer=self.tokenizer if use_table_token else None
         )
 
         # Decode the *generated part* only
         # inputs.input_ids.shape[1] gives the length of the prompt
         # output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
-        print(f'outputs: {outputs}')
         response = self.tokenizer.decode(
             outputs[-1],
             skip_special_tokens=True,
@@ -245,7 +255,7 @@ def main():
     parser.add_argument("--sample_limit", type=int, default=5, help="每个数据库的样本数量限制")
     parser.add_argument("--question_limit", type=int, default=5, help="每个样本的问题数量限制")
     parser.add_argument("--time_sleep", type=float, default=0, help="每次评估间隔时间")
-    parser.add_argument("--prompt_type", type=str, default="retrace_table", 
+    parser.add_argument("--prompt_type", type=str, default="default", 
                         choices=["default", "cot", "retrace_table"],
                         help="提示类型: default(原始提问), cot(思维链), retrace_table(表格增强)")
     parser.add_argument("--device", type=str, default="cuda:0", help="指定使用的设备，例如 'cuda:0'")
@@ -385,10 +395,10 @@ def test_single_question():
     2018/8/4,19393,N438WN,5784,13204,1320402,31454,MCO,12339,1233904,32337,IND,2025,2036.0,11.0,11.0,2244.0,-1.0,0.0,0,,140,128.0,,,,,,
     2018/8/5,20452,N857RW,3629,13930,1393006,30977,ORD,11193,1119302,33105,CVG,910,905.0,-5.0,0.0,1116.0,-13.0,0.0,0,,79,71.0,,,,,,
     2018/8/5,20409,N947JB,577,11697,1169706,32467,FLL,14771,1477104,32457,SFO,906,940.0,34.0,34.0,1241.0,36.0,36.0,0,,359,361.0,34.0,0.0,2.0,0.0,0.0
-    2018/8/7,19393,N7724A,945,14492,1449202,34492,RDU,10821,1082106,30852,BWI,1030,1025.0,-5.0,0.0,1132.0,-3.0,0.0,0,,65,67.0,,,,,
-    2018/8/8,19393,N276WN,2545,13158,1315805,33158,MAF,11259,1125903,30194,DAL,600,557.0,-3.0,0.0,703.0,-7.0,0.0,0,,70,66.0,,,,,
-    2018/8/10,20397,N505AE,5690,11057,1105703,31057,CLT,13485,1348502,33485,MSN,1427,1424.0,-3.0,0.0,1515.0,-18.0,0.0,0,,126,111.0,,,,,
-    2018/8/10,19687,N445QX,2368,14747,1474703,30559,SEA,11884,1188402,31884,GEG,725,724.0,-1.0,0.0,823.0,1.0,1.0,0,,57,59.0,,,,,
+    2018/8/7,19393,N7724A,945,14492,1449202,34492,RDU,10821,1082106,30852,BWI,1030,1025.0,-5.0,0.0,1132.0,-3.0,0.0,0,,65,67.0,,,,,,
+    2018/8/8,19393,N276WN,2545,13158,1315805,33158,MAF,11259,1125903,30194,DAL,600,557.0,-3.0,0.0,703.0,-7.0,0.0,0,,70,66.0,,,,,,
+    2018/8/10,20397,N505AE,5690,11057,1105703,31057,CLT,13485,1348502,33485,MSN,1427,1424.0,-3.0,0.0,1515.0,-18.0,0.0,0,,126,111.0,,,,,,
+    2018/8/10,19687,N445QX,2368,14747,1474703,30559,SEA,11884,1188402,31884,GEG,725,724.0,-1.0,0.0,823.0,1.0,1.0,0,,57,59.0,,,,,,
     2018/8/12,20363,N313PQ,4058,10397,1039707,30397,ATL,13795,1379502,33795,OAJ,2116,2112.0,-4.0,0.0,2235.0,-10.0,0.0,0,,89,83.0,,,,,
     2018/8/15,19977,N33266,2103,12266,1226603,31453,IAH,13204,1320402,31454,MCO,2003,2000.0,-3.0,0.0,2310.0,-15.0,0.0,0,,142,130.0,,,,,
     2018/8/15,20304,N814SK,4709,10529,1052906,30529,BDL,14492,1449202,34492,RDU,630,626.0,-4.0,0.0,801.0,-17.0,0.0,0,,108,95.0,,,,,
