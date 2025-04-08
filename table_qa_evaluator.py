@@ -64,19 +64,20 @@ class TableQAEvaluator:
             repetition_penalty=1.2,  # 增加重复惩罚，范围通常在1.0-1.5
             no_repeat_ngram_size=3,  # 禁止重复的n-gram大小
             length_penalty=1.0,  # 长度惩罚，小于1会倾向生成更短的回答
-            temperature=0.7,  # 控制生成的随机性，越小越保守
-            top_p=0.9,  # 控制采样范围，越小生成越保守
-            top_k=50,  # 只保留概率最高的前k个token
-        )
+            temperature=0.1,  # 控制生成的随机性，越小越保守
+            top_p=0.7,  # 控制采样范围，越小生成越保守
+            top_k=10,  # 只保留概率最高的前k个token
+            do_sample=True,
+            )
         print(f'self.generation_config.max_length: {self.generation_config.max_length}')
         print(f'self.model.config.max_position_embeddings: {self.model.config.max_position_embeddings}')
 
         apply_table_llama(
                 self.model,
-                starting_layer=9,
+                starting_layer=7,
                 ending_layer=12,
                 entropy_threshold=0.9,
-                retracing_ratio=0.05
+                retracing_ratio=0.1
             )
         print(f"模型 {model_path} 已加载完成")
         
@@ -175,45 +176,44 @@ class TableQAEvaluator:
                     timeSleep=current_time_sleep
                 )
                 
-                # 从结果数据库中统计指标
-                with sqlite3.connect(result_path) as conn:
-                    cursor = conn.cursor()
-                    # 获取当前scale和数据库的统计信息
-                    cursor.execute(f"""
-                        SELECT COUNT(*) as total,
-                               SUM(correct) as correct,
-                               SUM(CASE WHEN error != '' THEN 1 ELSE 0 END) as errors
-                        FROM {dbn}
-                        WHERE scale = ? AND model = ?
-                    """, (current_scale, model_name))
-                    
-                    stats = cursor.fetchone()
-                    if stats:
-                        total_questions += stats[0]
-                        correct_answers += stats[1]
-                        total_errors += stats[2]
-        
-        # 计算并输出评估指标
-        accuracy = (correct_answers / total_questions * 100) if total_questions > 0 else 0
-        error_rate = (total_errors / total_questions * 100) if total_questions > 0 else 0
+
+
+
+        with sqlite3.connect(result_path) as conn:
+            cursor = conn.cursor()
+            # 整体准确率
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE correct = 1")
+            correct_count = cursor.fetchone()[0]
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            total_count = cursor.fetchone()[0]
+            overall_accuracy = correct_count / total_count if total_count > 0 else 0
+
+            scale_accuracy = {}
+            cursor.execute(f"SELECT scale, COUNT(*) FROM {table_name} WHERE correct = 1 GROUP BY scale")
+            for scale, scale_correct_count in cursor.fetchall():
+                cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE scale = ?", (scale,))
+                scale_total_count = cursor.fetchone()[0]
+                scale_accuracy[scale] = scale_correct_count / scale_total_count if scale_total_count > 0 else 0
+
         
         print("\n=== 评估指标 ===")
-        print(f"总问题数: {total_questions}")
-        print(f"正确回答数: {correct_answers}")
-        print(f"错误数: {total_errors}")
-        print(f"准确率 (ACC): {accuracy:.2f}%")
-        print(f"错误率: {error_rate:.2f}%")
-        print(f"评估完成，结果已保存到 {result_path}")
+        print(f"总问题数: {total_count}")
+        print(f"正确回答数: {correct_count}")
+        print(f"整体准确率: {overall_accuracy:.2f}%")
+        print("\n各规模准确率:")
+        for scale, acc in scale_accuracy.items():
+            print(f"{scale} 规模: {acc:.2f}%")
+        print(f"\n评估完成，结果已保存到 {result_path}")
         
-        # 返回评估指标
+        # 返回所有统计指标
         return {
-            "total_questions": total_questions,
-            "correct_answers": correct_answers,
-            "total_errors": total_errors,
-            "accuracy": accuracy,
-            "error_rate": error_rate
+            "total_count": total_count,
+            "correct_count": correct_count,
+            "overall_accuracy": overall_accuracy * 100,  # 转换为百分比
+            "scale_accuracy": {
+                scale: acc * 100 for scale, acc in scale_accuracy.items()  # 转换为百分比
+            }
         }
-
 
 
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
@@ -332,6 +332,7 @@ def main():
                 layer.mlp.apply_table_injection = False
     
     # 存储所有scale的评估结果
+    # 初始化存储所有scale结果的字典
     all_results = {}
     
     # 对每个scale进行评估
@@ -364,9 +365,29 @@ def main():
 
     # 输出所有scale的评估结果总结
     print("\n=== 评估结果总结 ===")
+    total_correct = 0
+    total_questions = 0
+    
     for scale, metrics in all_results.items():
         print(f"\nScale: {scale}")
-        print(f"准确率 (ACC): {metrics['accuracy']:.2f}%")
+        print(f"总问题数: {metrics['total_count']}")
+        print(f"正确回答数: {metrics['correct_count']}")
+        print(f"准确率: {metrics['accuracy']:.2f}%")
+        
+        # 累计总数
+        total_correct += metrics['correct_count']
+        total_questions += metrics['total_count']
+    
+    # 计算整体准确率
+    overall_accuracy = (total_correct / total_questions * 100) if total_questions > 0 else 0
+    print("\n=== 整体统计 ===")
+    print(f"总问题数: {total_questions}")
+    print(f"总正确数: {total_correct}")
+    print(f"整体准确率: {overall_accuracy:.2f}%")
+        print("各规模准确率:")
+        for sub_scale, acc in metrics['scale_accuracy'].items():
+            print(f"  {sub_scale} 规模: {acc:.2f}%")
+        print(f"\n准确率 (ACC): {metrics['accuracy']:.2f}%")
         print(f"错误率: {metrics['error_rate']:.2f}%")
         
 # Single question test example
@@ -453,11 +474,11 @@ def test_single_question():
     ## Airlines
 
     FL_DATE,OP_CARRIER_AIRLINE_ID,TAIL_NUM,OP_CARRIER_FL_NUM,ORIGIN_AIRPORT_ID,ORIGIN_AIRPORT_SEQ_ID,ORIGIN_CITY_MARKET_ID,ORIGIN,DEST_AIRPORT_ID,DEST_AIRPORT_SEQ_ID,DEST_CITY_MARKET_ID,DEST,CRS_DEP_TIME,DEP_TIME,DEP_DELAY,DEP_DELAY_NEW,ARR_TIME,ARR_DELAY,ARR_DELAY_NEW,CANCELLED,CANCELLATION_CODE,CRS_ELAPSED_TIME,ACTUAL_ELAPSED_TIME,CARRIER_DELAY,WEATHER_DELAY,NAS_DELAY,SECURITY_DELAY,LATE_AIRCRAFT_DELAY
-    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,,,,,,,
+    2018/8/1,20398,N663AR,3558,13930,1393006,30977,ORD,11721,1172105,31721,FNT,1140,1131.0,-9.0,0.0,1324.0,-15.0,0.0,0,,59,53.0,,,,,,,,,,,,,
     2018/8/1,20378,N86324,6222,15624,1562404,31504,VPS,12266,1226603,31453,IAH,900,854.0,-6.0,0.0,1059.0,11.0,11.0,0,,108,125.0,,,,,,,,
     2018/8/2,19393,N8511K,738,10821,1082106,30852,BWI,11697,1169706,32467,FLL,1945,,,,,,,1,B,155,,,,,,
     2018/8/4,19393,N438WN,5784,13204,1320402,31454,MCO,12339,1233904,32337,IND,2025,2036.0,11.0,11.0,2244.0,-1.0,0.0,0,,140,128.0,,,,,,,
-    2018/8/5,20452,N857RW,3629,13930,1393006,30977,ORD,11193,1119302,33105,CVG,910,905.0,-5.0,0.0,1116.0,-13.0,0.0,0,,79,71.0,,,,,,
+    2018/8/5,20452,N857RW,3629,13930,1393006,30977,ORD,11193,1119302,33105,CVG,910,905.0,-5.0,0.0,1116.0,-13.0,0.0,0,,79,71.0,,,,,,,
     2018/8/5,20409,N947JB,577,11697,1169706,32467,FLL,14771,1477104,32457,SFO,906,940.0,34.0,34.0,1241.0,36.0,36.0,0,,359,361.0,34.0,0.0,2.0,0.0,0.0
     2018/8/7,19393,N7724A,945,14492,1449202,34492,RDU,10821,1082106,30852,BWI,1030,1025.0,-5.0,0.0,1132.0,-3.0,0.0,0,,65,67.0,,,,,,
     2018/8/8,19393,N276WN,2545,13158,1315805,33158,MAF,11259,1125903,30194,DAL,600,557.0,-3.0,0.0,703.0,-7.0,0.0,0,,70,66.0,,,,,,
