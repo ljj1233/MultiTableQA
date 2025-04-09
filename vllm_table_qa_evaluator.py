@@ -211,7 +211,7 @@ class VLLMTableQAEvaluator:
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful AI assistant that analyzes tables and provides concise summaries."
+                "content": "You are a helpful AI assistant that analyzes tables "
             },
             {
                 "role": "user",

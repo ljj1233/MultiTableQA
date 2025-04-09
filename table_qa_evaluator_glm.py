@@ -254,7 +254,7 @@ class TableQAEvaluator:
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful AI assistant that analyzes tables and solve the problem"
+                "content": "You are a helpful AI assistant that analyzes tables "
             },
             {
                 "role": "user",
