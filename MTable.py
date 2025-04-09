@@ -393,21 +393,18 @@ def table_forward(
 
             k_topk = 5
             top_k_scores, _ = torch.topk(last_token_logits, k_topk)
-            # 添加temperature参数来控制分布
             epsilon = 1e-9
 
-            probabilities = F.softmax(top_k_scores, dim=-1)
+            # 应用温度参数使分布更加平滑或尖锐
+            temperature = 1.0  #  >1 更平滑，<1 更尖锐
+            scaled_scores = top_k_scores / temperature
 
-            entropy = torch.sum((-probabilities[:k_topk] * torch.log(probabilities[:k_topk]))/np.log(k_topk))
-            avg_entropy = entropy.item()
+            probabilities = F.softmax(scaled_scores, dim=-1)
 
-            # entropy = -torch.sum(probabilities[:k_topk] * torch.log(probabilities[:k_topk] + epsilon), dim=-1)
-            # avg_entropy = torch.mean(entropy / math.log(k_topk)).item()
-            
-            entropy = -torch.sum(probabilities * torch.log(probabilities + epsilon), dim=-1)
-            # 归一化
-            avg_entropy = torch.mean(entropy / math.log(k_topk)).item()
-            # print(f'avg_entropy: {avg_entropy}')
+            entropy = -torch.sum(probabilities * torch.log2(probabilities + epsilon))
+            normalized_entropy = entropy / math.log2(k_topk)
+            avg_entropy = normalized_entropy.item()
+
 
             if avg_entropy > entropy_threshold:
                 table_retracing_event = True 

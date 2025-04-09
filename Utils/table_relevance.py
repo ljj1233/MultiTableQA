@@ -9,22 +9,75 @@ class TableRelevanceExtractor:
     用于使用LLM识别表格中与问题相关的行
     """
     
-    def __init__(self, model, tokenizer, device="cuda:0"):
+    def __init__(self, llm, tokenizer, device="cuda:0"):
         """
         初始化表格相关行提取器
         
         参数:
-            model: 预训练语言模型
+            llm: VLLM模型实例
             tokenizer: 分词器
             device: 设备名称
         """
-        self.model = model
+        self.llm = llm
         self.tokenizer = tokenizer
         self.device = device
     
+    def extract_relevant_rows(self, table_content, question, use_llm=False):
+        """
+        提取与问题相关的表格行
+        
+        参数:
+            table_content: 表格内容
+            question: 问题
+            use_llm: 是否使用LLM进行提取
+            
+        返回:
+            处理后的表格内容
+        """
+        if not use_llm:
+            return table_content
+            
+        # 解析表格内容
+        tables = self._parse_tables(table_content)
+        if not tables:
+            return table_content
+            
+        # 处理每个表格
+        processed_tables = []
+        for table in tables:
+            df = table.get('df')
+            if df is None or df.empty:
+                processed_tables.append(table['raw_content'])
+                continue
+                
+            # 获取相关行
+            relevant_indices = self.get_relevant_rows(df, table.get('name', 'Unknown'), question)
+            if not relevant_indices or relevant_indices == ["No relevant rows"]:
+                processed_tables.append(table['raw_content'])
+                continue
+                
+            # 筛选相关行
+            try:
+                indices = [int(idx) for idx in relevant_indices if idx.isdigit()]
+                if indices:
+                    filtered_df = df.iloc[indices]
+                    # 重新格式化为表格
+                    if 'markdown' in table:
+                        processed_content = self._format_as_markdown(filtered_df, table.get('name', ''))
+                    else:
+                        processed_content = self._format_as_text(filtered_df, table.get('name', ''))
+                    processed_tables.append(processed_content)
+                else:
+                    processed_tables.append(table['raw_content'])
+            except Exception as e:
+                print(f"筛选表格行时出错: {e}")
+                processed_tables.append(table['raw_content'])
+                
+        return "\n\n".join(processed_tables)
+    
     def get_relevant_rows(self, df, table_name, question, max_rows=15):
         """
-        使用LLM来确定表格中与问题相关的行索引
+        使用VLLM来确定表格中与问题相关的行索引
         
         参数:
             df (pd.DataFrame): 表格数据
@@ -33,12 +86,12 @@ class TableRelevanceExtractor:
             max_rows (int): 返回的最大相关行索引数量
             
         返回:
-            List[int]: 相关行索引列表，数量不超过max_rows
+            List[str]: 相关行索引列表，数量不超过max_rows
         """
         if df.empty:
             return []
 
-        # --- 优化的提示模板 ---
+        # 构建提示
         prompt = f"""Your task is to identify the most relevant row indices from the table below to answer the given question.
 
         Question: {question}
@@ -59,92 +112,104 @@ class TableRelevanceExtractor:
 
         Relevant row indices:"""
 
-        # --- 生成配置 ---
-        # 选项1: 更确定性的生成（通常更适合提取任务）
-        simple_gen_config = GenerationConfig(
-            max_new_tokens=150,  # 允许更多的token以确保安全
-            do_sample=False,     # 使用贪婪解码或束搜索（如果模型支持）
-            num_beams=3,         # 束搜索示例
-            early_stopping=True, # 如果达到EOS则提前停止
-            temperature=None,    # 对于do_sample=False不需要
-            top_p=None           # 对于do_sample=False不需要
-        )
-
-        # --- 输入准备 ---
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            prompt_text = self.tokenizer.apply_chat_template(
+        # 使用VLLM生成回答
+        from vllm import SamplingParams
+        
+        # 准备输入提示
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        
+        # 将消息转换为提示格式
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            formatted_prompt = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True
             )
-        except Exception as e:
-            print(f"应用聊天模板时出错: {e}。回退到原始提示。")
-            prompt_text = prompt # 模板失败时的回退方案
-
-        # --- 输入标记化和长度计算 ---
-        # 为输入标记计算更动态的max_length
-        # 为生成配置的max_new_tokens和缓冲区预留空间
-        model_max_len = getattr(self.model.config, 'max_position_embeddings', 4096) # 获取模型的最大长度
-        reserved_space = simple_gen_config.max_new_tokens + 50 # 为输出和缓冲区预留空间
-        input_max_len = model_max_len - reserved_space
-        if input_max_len <= 0:
-             print(f"警告: 模型最大长度({model_max_len})对于预留空间({reserved_space})来说太小。进行调整。")
-             input_max_len = model_max_len // 2 # 或其他启发式方法
-
-        inputs = self.tokenizer(
-            prompt_text,
-            return_tensors="pt",
-            padding=True,        # 如果有多个提示（这里没有），则填充到批次的最大长度
-            truncation=True,     # 如果超过input_max_len则截断
-            max_length=input_max_len # 使用计算的最大长度
-        ).to(self.device)
-
-        # 检查是否过度截断
-        if inputs.input_ids.shape[1] >= input_max_len:
-             print(f"警告: 表'{table_name}'的LLM过滤提示被截断至{input_max_len}个tokens。上下文可能丢失。")
-
-        # --- LLM生成 ---
-        relevant_indices = []
+        else:
+            # 如果tokenizer没有apply_chat_template方法，使用简单格式
+            formatted_prompt = f"User: {prompt}\n\nAssistant:"
+        
+        # 使用VLLM生成回答
+        sampling_params = SamplingParams(
+            temperature=0.1,
+            top_p=0.5,
+            max_tokens=150,
+            repetition_penalty=1.2,
+            n=1
+        )
+        
+        outputs = self.llm.generate(formatted_prompt, sampling_params)
+        
+        # 获取生成的文本
+        response = outputs[0].outputs[0].text.strip()
+        
+        # 解析回答
+        if "No relevant rows" in response:
+            return ["No relevant rows"]
+        
+        # 提取逗号分隔的索引
+        indices = []
+        for item in response.split(','):
+            item = item.strip()
+            if item.isdigit():
+                indices.append(item)
+        
+        # 限制返回的行数
+        return indices[:max_rows]
+    
+    def _parse_tables(self, table_content):
+        """解析表格内容为DataFrame"""
+        # 简单实现，实际应用中可能需要更复杂的解析逻辑
+        from .table_parser import parse_markdown_table
+        import pandas as pd
+        from io import StringIO
+        
+        tables = []
+        
+        # 尝试解析Markdown表格
+        markdown_tables = parse_markdown_table(table_content)
+        if markdown_tables:
+            for i, table in enumerate(markdown_tables):
+                tables.append({
+                    'name': f"Table_{i+1}",
+                    'df': table,
+                    'raw_content': table_content,
+                    'markdown': True
+                })
+            return tables
+        
+        # 尝试解析CSV格式
         try:
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    generation_config=simple_gen_config,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
-
-            # --- 输出解码和解析 ---
-            # 仅解码生成的部分
-            output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
-            output_text = self.tokenizer.decode(
-                output_token_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True
-            ).strip()
-
-            if "no relevant rows" in output_text.lower(): # 不区分大小写检查
-                return []
-
-            # 使用正则表达式提取索引，转换为int，验证是否在df.index中
-            extracted_indices = set() # 使用集合处理LLM输出中的重复项
-            for token in re.findall(r'\d+', output_text):
-                try:
-                    idx = int(token)
-                    if idx in df.index: # 检查索引对于*原始*df是否有效
-                        extracted_indices.add(idx)
-                except ValueError:
-                    continue # 忽略非整数标记
-
-            # 将集合转回列表并排序以保持一致性（可选）
-            relevant_indices = sorted(list(extracted_indices))
-
-            # 限制为max_rows
-            return relevant_indices[:max_rows]
-
-        except Exception as e:
-            print(f"警告: 表'{table_name}'的LLM相关性生成或解析过程中出错: {e}")
-            return [] # 出错时返回空列表
+            df = pd.read_csv(StringIO(table_content))
+            tables.append({
+                'name': "Table_1",
+                'df': df,
+                'raw_content': table_content
+            })
+            return tables
+        except:
+            pass
+        
+        # 返回原始内容
+        return [{
+            'name': "Unknown",
+            'df': None,
+            'raw_content': table_content
+        }]
+    
+    def _format_as_markdown(self, df, name):
+        """将DataFrame格式化为Markdown表格"""
+        result = f"## {name}\n\n"
+        result += df.to_markdown(index=False)
+        return result
+    
+    def _format_as_text(self, df, name):
+        """将DataFrame格式化为文本表格"""
+        result = f"## {name}\n\n"
+        result += df.to_string(index=False)
+        return result
     
     def get_relevant_columns(self, df, question_keywords, include_ids=True):
         """

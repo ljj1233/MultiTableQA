@@ -13,7 +13,7 @@ class TableProcessor:
     def __init__(self, tokenizer, relevance_extractor, llm_model, device="cuda:0", table_token_budget=2048):
         self.tokenizer = tokenizer
         self.relevance_extractor = relevance_extractor
-        self.llm_model = llm_model
+        self.llm_model = llm_model  # 这里应该是VLLMTableQAEvaluator实例
         self.device = device
         self.table_token_budget = table_token_budget
 
@@ -70,6 +70,54 @@ class TableProcessor:
                 relevant_columns = all_columns if all_columns else list(df.columns)
     
         return summary, relevant_columns
+
+    def _simplify_table_content(self, table_content, question):
+        max_chars = self.table_token_budget * 4  # 粗略估计每个token约4个字符
+        if len(table_content) > max_chars:
+            return table_content[:max_chars] + "\n...(表格内容已截断)"
+        
+        return table_content
+
+    def align_entities(self, parsed_tables, question):
+        """
+        识别多个表格之间的实体关系
+        
+        参数:
+            parsed_tables: 解析后的表格列表
+            question: 问题文本
+            
+        返回:
+            实体对齐信息字符串
+        """
+        if len(parsed_tables) <= 1:
+            return ""
+            
+        # 构建提示
+        prompt = "Please identify the relationships between the following tables:\n\n"
+        
+        for table in parsed_tables:
+            prompt += f"Table: {table['name']}\n"
+            prompt += f"Columns: {', '.join(table['df'].columns)}\n"
+            prompt += f"Sample data:\n{table['df'].head(2).to_string()}\n\n"
+            
+        prompt += f"Question: {question}\n\n"
+        prompt += "Task: Identify the key columns that can be used to join these tables. Format your response as:\n"
+        prompt += "Table1.column1 = Table2.column2\n"
+        prompt += "Table2.column3 = Table3.column4\n"
+        prompt += "etc."
+        
+        # 使用VLLM生成回答
+        response = self.llm_model.generate(prompt)
+        
+        # 简单处理响应
+        lines = response.strip().split('\n')
+        valid_lines = []
+        
+        for line in lines:
+            if '=' in line and any(table['name'] in line for table in parsed_tables):
+                valid_lines.append(line.strip())
+                
+        return '\n'.join(valid_lines) if valid_lines else "No clear relationships identified"
 
     def process_table_content(self, db_str, question, use_llm_for_relevance=False, markdown=True):
         """处理表格内容，返回token和处理后的文本"""
