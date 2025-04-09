@@ -156,6 +156,7 @@ class TaskCore:
         """
         func need to be a call function have 3 arguments -- dbStr, question, choicesStr
         """
+        print(len(dbLimit), len(sampleLimit), len(questionLimit))
         for dbIdx in tqdm(range(dbLimit)):
             for sampleIdx in range(sampleLimit):
                 for questionIdx in range(questionLimit):

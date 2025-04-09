@@ -3,4 +3,10 @@ Table data:
 {db_str}
 Question:
 {question}
-This question has a single correct answer. Decompose the question, assess each option, and explain the correctness or incorrectness of each. Conclude with your final answer on a new line as Answer: A/B/C/D.
+Instructions:
+1. Identify the key information from the tables
+2. Analyze each option briefly and clearly
+3. Provide your reasoning in a concise manner
+4. End with "Answer: [A/B/C/D]" on a new line
+
+Remember to complete your entire response without truncation.

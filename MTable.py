@@ -316,9 +316,13 @@ def table_forward(
                 next_layer_mlp.retracing_ratio = retracing_ratio
                 
         if decoder_layer.mlp.adapt_signal == 1:
+            # 重置所有相关状态
             decoder_layer.mlp.adapt_signal = 0
             decoder_layer.mlp.adpt_w1 = None
             decoder_layer.mlp.adpt_w2 = None
+            # 确保清理表格嵌入
+            if hasattr(decoder_layer.mlp, 'table_seq_embedding'):
+                decoder_layer.mlp.table_seq_embedding = None
 
 
 

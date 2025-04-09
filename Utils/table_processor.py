@@ -25,7 +25,7 @@ class TableProcessor:
         self.device = device
         self.table_token_budget = table_token_budget
     
-    def process_table_content(self, db_str, question, use_llm_for_relevance=False):
+    def process_table_content(self, db_str, question, use_llm_for_relevance=False,markdown=True):
         """
         解析多表格Markdown/CSV，提取相关模式和行（带列过滤），
         线性化，并在预算内标记化。
@@ -34,6 +34,7 @@ class TableProcessor:
             db_str (str): 数据库表格字符串表示。
             question (str): 问题文本。
             use_llm_for_relevance (bool): 启用基于LLM的行过滤的标志。
+            markdown: markdown--True,csv--False
 
         返回:
             torch.Tensor or None: 处理后的表格token ID或失败时为None。

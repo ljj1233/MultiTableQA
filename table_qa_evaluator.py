@@ -22,8 +22,9 @@ class TableQAEvaluator:
         self.device = device
         self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 5000  # 增加token预算以处理更多表格数据
-        
+        self.table_token_budget = 5000   
+        self.markdown=True
+
         apply_table_function()
 
         # 加载模型配置
@@ -56,7 +57,7 @@ class TableQAEvaluator:
         # 初始化生成配置
         self.generation_config = GenerationConfig(
             num_beams=3,
-            max_length=20000,
+            max_length=30000,
             early_stopping=True,  # 改为 True，当达到停止条件时提前结束生成
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
@@ -81,11 +82,11 @@ class TableQAEvaluator:
         print(f"模型 {model_path} 已加载完成")
         
         # 初始化表格相关行提取器
-        # self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
+        self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
         
         # 初始化表格处理器
         self.table_processor = SingleTableProcessor(self.tokenizer, self.device, self.table_token_budget)
-        # self.table_processor = TableProcessor(self.tokenizer, self.relevance_extractor, self.device, self.table_token_budget)
+        self.table_processor = TableProcessor(self.tokenizer, self.relevance_extractor, self.device, self.table_token_budget)
   
 
     def _load_prompt_templates(self,prompt_type="default"):
@@ -128,13 +129,13 @@ class TableQAEvaluator:
         """
         # 初始化TaskCore
         task_core = TaskCore(db_root, task_path, result_path)
-        
+        self.markdown=markdown
         # 获取模型名称，根据提示类型添加后缀
         model_name = f"TableLlama_{prompt_type}"
         
         # 创建一个包装函数，将prompt_type传递给answer_question
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
-            return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type)
+            return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type,markdown=markdown)
         
         # 初始化评估指标和结果存储
         all_results = {}
@@ -239,7 +240,7 @@ class TableQAEvaluator:
         }
 
 
-    def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
+    def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default",markdown=True):
         """
         回答问题 (Modified to pass question to process_table_content)
         """
@@ -280,7 +281,7 @@ class TableQAEvaluator:
         use_table_token = prompt_type == "retrace_table"
         if use_table_token:
              # 使用表格处理器处理表格内容
-             table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
+             table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance,markdown)
 
              if table_token_ids is not None:
                  table_token_ids = table_token_ids.to(self.device)
@@ -291,7 +292,7 @@ class TableQAEvaluator:
         outputs = self.model.generate(
             **inputs,
             generation_config=self.generation_config,
-            max_new_tokens=10000,
+            max_new_tokens=20000,
             table_token=table_token_ids if use_table_token else None,
             tokenizer=self.tokenizer if use_table_token else None
         )
@@ -400,7 +401,9 @@ def main():
             print(f"\nScale: {scale}")
             print(f"总问题数: {metrics['total_count']}")
             print(f"正确回答数: {metrics['correct_count']}")
-            print(f"准确率: {metrics['accuracy']:.2f}%")
+            # 计算准确率
+            accuracy = (metrics['correct_count'] / metrics['total_count'] * 100) if metrics['total_count'] > 0 else 0
+            print(f"准确率: {accuracy:.2f}%")
             
             # 累计总数
             total_correct += metrics['correct_count']
@@ -416,8 +419,6 @@ def main():
         for scale, metrics in all_results[format_type].items():
             for sub_scale, acc in metrics['scale_accuracy'].items():
                 print(f"  {sub_scale} 规模: {acc:.2f}%")
-    print(f"\n准确率 (ACC): {metrics['accuracy']:.2f}%")
-    print(f"错误率: {metrics['error_rate']:.2f}%")
         
 # Single question test example
 def test_single_question():

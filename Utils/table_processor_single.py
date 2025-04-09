@@ -23,7 +23,7 @@ class SingleTableProcessor:
         self.device = device
         self.table_token_budget = table_token_budget
     
-    def process_table_content(self, db_str, question=None, use_llm_for_relevance=False):
+    def process_table_content(self, db_str, question=None, use_llm_for_relevance=False,markdown=True):
         """
         简单处理表格内容：直接分词，不做任何预处理
         
