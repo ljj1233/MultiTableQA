@@ -3,7 +3,8 @@ import torch
 import argparse
 import re
 import sqlite3  
-from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig, GenerationConfig,Qwen2Config
+from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig, GenerationConfig
+from modelscope import AutoModelForCausalLM as MSAutoModelForCausalLM, AutoTokenizer as MSAutoTokenizer
 from MTable import apply_table_llama, apply_table_function,apply_table_function_qwen,apply_table_function_glm
 from Utils.dataLoader import TaskCore
 from Utils.table_relevance import TableRelevanceExtractor
@@ -26,66 +27,79 @@ class TableQAEvaluator:
         
         apply_table_function_glm()
 
-        # 加载模型配置
-        self.config = Qwen2Config.from_pretrained(model_path)
-        self.config.rope_scaling = {
-            "type": "linear",
-            "factor": 2.0
-        }
+        # 判断是否为GLM模型
+        self.is_glm_model = "glm" in model_path.lower()
         
         # 加载模型和分词器
+        print(f"正在加载GLM模型: {model_path}")
+        # 使用modelscope加载GLM模型
+        self.tokenizer = MSAutoTokenizer.from_pretrained(
+                model_path, 
+                trust_remote_code=True
+        )
+            
         if multi_gpu and torch.cuda.device_count() > 1:
             print(f"使用 {torch.cuda.device_count()} 个 GPU 进行并行计算")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                config=self.config,
-                torch_dtype=torch.float16,
-                device_map="auto"  # 自动分配到可用的GPU上
-            )
+            self.model = MSAutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                    device_map="auto"  # 自动分配到可用的GPU上
+                )
         else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                config=self.config,
-                torch_dtype=torch.float16
-            ).to(device)
+            self.model = MSAutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True
+                ).to(device).eval()
+            
+        # GLM模型的生成配置
+        self.generation_config = {
+                "max_length": 30000,
+                "do_sample": True,
+                "top_k": 5,
+                "top_p": 0.5,
+                "temperature": 0.1,
+                "repetition_penalty": 1.2,
+            }
+    
+            
         
+            
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        # self.tokenizer.pad_token = self.tokenizer.eos_token   
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                
         # 初始化生成配置
         self.generation_config = GenerationConfig(
-            num_beams=5,
-            max_length=30000,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-            # 添加以下参数来控制生成质量
-            repetition_penalty=1.2,  # 增加重复惩罚，范围通常在1.0-1.5
-            no_repeat_ngram_size=3,  # 禁止重复的n-gram大小
-            length_penalty=1.0,  # 长度惩罚，小于1会倾向生成更短的回答
-            temperature=0.1,  # 控制生成的随机性，越小越保守
-            top_p=0.5,  # 控制采样范围，越小生成越保守
-            do_sample=True,
+                num_beams=5,
+                max_length=30000,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+                # 添加以下参数来控制生成质量
+                repetition_penalty=1.2,  # 增加重复惩罚，范围通常在1.0-1.5
+                no_repeat_ngram_size=3,  # 禁止重复的n-gram大小
+                length_penalty=1.0,  # 长度惩罚，小于1会倾向生成更短的回答
+                temperature=0.1,  # 控制生成的随机性，越小越保守
+                top_p=0.5,  # 控制采样范围，越小生成越保守
+                do_sample=True,
             )
-        # print(f'self.generation_config.max_length: {self.generation_config.max_length}')
-        # print(f'self.model.config.max_position_embeddings: {self.model.config.max_position_embeddings}')
 
+        # 应用表格增强功能
         apply_table_llama(
-                self.model,
-                starting_layer=10,
-                ending_layer=13,
-                entropy_threshold=0.9,
-                retracing_ratio=0.05
-            )
+            self.model,
+            starting_layer=10,
+            ending_layer=13,
+            entropy_threshold=0.9,
+            retracing_ratio=0.05
+        )
         print(f"模型 {model_path} 已加载完成")
-        
-        # 初始化表格相关行提取器
-        # self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
         
         # 初始化表格处理器
         self.table_processor = SingleTableProcessor(self.tokenizer, self.device, self.table_token_budget)
-        # self.table_processor = TableProcessor(self.tokenizer, self.relevance_extractor, self.device, self.table_token_budget)
-  
+
 
     def _load_prompt_templates(self,prompt_type="default"):
         """
@@ -240,27 +254,28 @@ class TableQAEvaluator:
 
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
         """
-        回答问题 (Modified to pass question to process_table_content)
+        回答问题 (Modified for GLM model)
         """
         prompt_template = self._load_prompt_templates(prompt_type)
         full_prompt = prompt_template.format(db_str=db_str, question=question) # Use original db_str in prompt
-
+    
         if choices_str and "{choices_str}" not in prompt_template:
             full_prompt += f"\n\n{choices_str}"
         elif choices_str:
             full_prompt = full_prompt.replace("{choices_str}", choices_str)
-
-        # Prepare input prompt tokens
+    
+        # 为GLM模型准备输入
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful AI assistant that analyzes tables "
+                "content": "You are a helpful AI assistant that analyzes tables"
             },
             {
                 "role": "user",
                 "content": full_prompt 
             }
         ]
+        
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -270,36 +285,30 @@ class TableQAEvaluator:
             [prompt],
             return_tensors="pt",
         ).to(self.device)
-        max_new_tokens = 20000
+        
         # --- Generate Table Token IDs for Injection ---
         table_token_ids = None
         use_table_token = prompt_type == "retrace_table"
         if use_table_token:
-             # 使用表格处理器处理表格内容
-             table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
-
-             if table_token_ids is not None:
-                 table_token_ids = table_token_ids.to(self.device)
-
-
-        # --- Generate Answer ---
-        # Ensure table_token is handled correctly by your modified model.generate
-        outputs = self.model.generate(
-            **inputs,
-            generation_config=self.generation_config,
-            max_new_tokens=20000,
-            table_token=table_token_ids if use_table_token else None,
-            tokenizer=self.tokenizer if use_table_token else None
-        )
-
-        # Decode the *generated part* only
-        # inputs.input_ids.shape[1] gives the length of the prompt
-        # output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
-        generated_ids = [ output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, outputs)]
-        response = self.tokenizer.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-        )[0]
+            # 使用表格处理器处理表格内容
+            table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
+    
+            if table_token_ids is not None:
+                table_token_ids = table_token_ids.to(self.device)
+    
+        # --- 使用GLM模型生成回答 ---
+        gen_kwargs = {
+            **self.generation_config,
+            "max_new_tokens": 20000,
+            "table_token": table_token_ids if use_table_token else None,
+            "tokenizer": self.tokenizer if use_table_token else None
+        }
+        
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, **gen_kwargs)
+            outputs = outputs[:, inputs['input_ids'].shape[1]:]
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
         tokens = self.tokenizer.encode(response, add_special_tokens=False)
         print(f"response 的 token 数量: {len(tokens)}")
 
