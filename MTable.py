@@ -85,8 +85,6 @@ class LlamaMLP(nn.Module):
         self.ending_layer = 32
         self.adapt_signal = 0
 
-        # --- No learnable adapter weights (adpt_w1, adpt_w2 removed) ---
-        # --- No learnable cross-attention layer ---
 
         # Hyperparameter for non-learnable attention
         self.attention_temperature = self.hidden_size**0.5
@@ -107,7 +105,7 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x): # x shape: (Batch, SeqLen_x, Hidden)
 
-        if self.config.pretraining_tp > 1:
+        if hasattr(self.config, 'pretraining_tp') and self.config.pretraining_tp > 1:
             print("Warning: Tensor Parallel > 1 detected. Injection logic might need adjustment. Falling back.")
             ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
             down_proj = self.down_proj(ffn_intermediate)
@@ -173,6 +171,103 @@ class LlamaMLP(nn.Module):
             down_proj = self.down_proj(ffn_intermediate)
 
         return down_proj
+
+class GlmMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_up_proj = nn.Linear(self.hidden_size, 2*self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+        # --- Table Injection Parameters ---
+        self.apply_table_injection = False
+        # Store the sequence embedding directly, not adapter weights
+        self.table_token = None  
+        self.table_embedding = None # Shape: (SeqLen_table, Hidden)
+        self.retracing_ratio = 0.05 # Example: Blending factor for the attention output
+        self.entropy_threshold = 1.0
+        self.starting_layer = 0
+        self.ending_layer = 32
+        self.adapt_signal = 0
+
+
+        # Hyperparameter for non-learnable attention
+        self.attention_temperature = self.hidden_size**0.5
+
+    def initialize_table_embedding(self, table_embedding):
+        """Stores the processed table embedding sequence. Non-learnable."""
+
+        ref_param = self.gate_up_proj.weight
+        target_device = ref_param.device
+        target_dtype = ref_param.dtype
+
+        table_embedding = table_embedding.to(target_device, dtype=target_dtype)
+
+        if table_embedding.ndim == 3 and table_embedding.shape[0] == 1:
+            # Squeeze batch dim: Result shape (SeqLen_table, H)
+            self.table_seq_embedding = table_embedding.squeeze(0)
+            # print(f"DEBUG: Stored table_seq_embedding with shape {self.table_seq_embedding.shape}")
+
+    def forward(self, x): # x shape: (Batch, SeqLen_x, Hidden)
+
+
+
+        if self.adapt_signal == 1 and self.table_seq_embedding is not None:
+            # --- Non-Learnable Cross-Attention Path ---
+            try:
+                up_states = self.gate_up_proj(x)
+                
+                gate, up_states = up_states.chunk(2,dim=-1)
+                up_states = up_states  * self.act_fn(gate)
+
+                ffn_out = self.down_proj(up_states)
+
+                query = x # (B, S_x, H)
+                key = self.table_seq_embedding # (S_table, H)
+                value = self.table_seq_embedding # (S_table, H)
+
+                key = key.to(query.device, dtype=query.dtype)
+                value = value.to(query.device, dtype=query.dtype)
+
+                query_norm = F.normalize(query, p=2, dim=-1) # (B, S_x, H)
+                key_norm = F.normalize(key, p=2, dim=-1)   # (S_table, H)
+
+                similarity_scores = torch.matmul(query_norm, key_norm.t()) # Result shape (B, S_x, S_table)
+
+                attention_weights = F.softmax(similarity_scores / self.attention_temperature, dim=-1)
+
+                value_expanded = value.unsqueeze(0).expand(x.shape[0], -1, -1) # (B, S_table, H)
+                attn_output = torch.matmul(attention_weights, value_expanded)
+
+ 
+                down_proj = (ffn_out * (1 - self.retracing_ratio) + attn_output * self.retracing_ratio)
+
+ 
+
+            except Exception as e:
+                print(f"Error during non-learnable cross-attention: {e}. Falling back to normal FFN.")
+                # Fallback to normal FFN path on error
+                ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+                down_proj = self.down_proj(ffn_intermediate)
+
+        else:
+            up_states = self.gate_up_proj(x)
+                
+            gate, up_states = up_states.chunk(2,dim=-1)
+            up_states = up_states  * self.act_fn(gate)
+
+            down_proj = self.down_proj(up_states)
+
+        return down_proj
+
+
+
+
+
+
 
 def table_forward(
         self,
@@ -293,17 +388,27 @@ def table_forward(
             norm_hidden_states = self.norm(hidden_states)
             logits = self.lm_head(norm_hidden_states)
             last_token_logits = logits[:, -1, :]
-            last_token_logits = last_token_logits.float() # Ensure float32 for stable softmax/log
+            last_token_logits = last_token_logits.float()
+            last_token_logits = self.logits_processor(input_ids, last_token_logits)
 
-            # Calculate entropy (using top-k approximation like LLaVA for efficiency)
-            k_topk = 10  
+            k_topk = 5
             top_k_scores, _ = torch.topk(last_token_logits, k_topk)
+            # 添加temperature参数来控制分布
+            epsilon = 1e-9
+
             probabilities = F.softmax(top_k_scores, dim=-1)
 
-            epsilon_log = 1e-9
-            entropy = -torch.sum(probabilities * torch.log(probabilities.clamp(min=epsilon_log)), dim=-1)
-            entropy = entropy / np.log(k_topk)
-            avg_entropy = torch.mean(entropy).item()
+            entropy = torch.sum((-probabilities[:k_topk] * torch.log(probabilities[:k_topk]))/np.log(k_topk))
+            avg_entropy = entropy.item()
+
+            # entropy = -torch.sum(probabilities[:k_topk] * torch.log(probabilities[:k_topk] + epsilon), dim=-1)
+            # avg_entropy = torch.mean(entropy / math.log(k_topk)).item()
+            
+            entropy = -torch.sum(probabilities * torch.log(probabilities + epsilon), dim=-1)
+            # 归一化
+            avg_entropy = torch.mean(entropy / math.log(k_topk)).item()
+            # print(f'avg_entropy: {avg_entropy}')
+
             if avg_entropy > entropy_threshold:
                 table_retracing_event = True 
                 next_layer_mlp = self.layers[layer_idx + 1].mlp
@@ -311,18 +416,14 @@ def table_forward(
                 current_table_token = self.layers[0].mlp.table_token.to(input_ids.device)  # Retrieve shared token
                 table_embeds = self.embed_tokens(current_table_token)
                 next_layer_mlp.initialize_table_embedding(table_embeds)
-                # print(f"add table feature to layer {layer_idx}")
+                # print(f"add table feature to layer {layer_idx},avg_entropy: {avg_entropy}")
                 next_layer_mlp.adapt_signal = 1
                 next_layer_mlp.retracing_ratio = retracing_ratio
                 
         if decoder_layer.mlp.adapt_signal == 1:
-            # 重置所有相关状态
             decoder_layer.mlp.adapt_signal = 0
             decoder_layer.mlp.adpt_w1 = None
             decoder_layer.mlp.adpt_w2 = None
-            # 确保清理表格嵌入
-            if hasattr(decoder_layer.mlp, 'table_seq_embedding'):
-                decoder_layer.mlp.table_seq_embedding = None
 
 
 
@@ -395,6 +496,7 @@ def generate(
         synced_gpus = (is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)) and dist.get_world_size() > 1
 
     logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+    self.model.logits_processor = logits_processor
     stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
 
     accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
@@ -752,6 +854,15 @@ def apply_table_function():
     transformers.models.llama.modeling_llama.LlamaModel.forward = table_forward
     transformers.models.llama.modeling_llama.LlamaForCausalLM.generate = generate
 
+def apply_table_function_qwen():
+    transformers.models.qwen2.modeling_qwen2.Qwen2MLP = LlamaMLP
+    transformers.models.qwen2.modeling_qwen2.Qwen2Model.forward = table_forward
+    transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM.generate = generate
+
+def apply_table_function_glm():
+    transformers.models.glm.modeling_glm.GlmMLP = GlmMLP
+    transformers.models.glm.modeling_glm.GlmModel.forward = table_forward
+    transformers.models.glm.modeling_glm.GlmForCausalLM.generate = generate
 
 def apply_table_llama(
         self,

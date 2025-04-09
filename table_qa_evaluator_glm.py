@@ -3,8 +3,8 @@ import torch
 import argparse
 import re
 import sqlite3  
-from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig, GenerationConfig
-from MTable import apply_table_llama, apply_table_function_llama,apply_table_qwen
+from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig, GenerationConfig,Qwen2Config
+from MTable import apply_table_llama, apply_table_function,apply_table_function_qwen,apply_table_function_glm
 from Utils.dataLoader import TaskCore
 from Utils.table_relevance import TableRelevanceExtractor
 from Utils.table_parser import parse_markdown_table  
@@ -17,20 +17,17 @@ from io import StringIO
 
 from tqdm import tqdm
 class TableQAEvaluator:
-    # 在 TableQAEvaluator 类的 __init__ 方法中修改
-    
     def __init__(self, model_path, device="cuda:0", multi_gpu=False, use_llm_for_relevance=False):
         # 初始化 TableLlama 模型
         self.device = device
         self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 5000   
-        self.markdown=True
-
-        apply_table_function_llama()
+        self.table_token_budget = 8000   
+        
+        apply_table_function_glm()
 
         # 加载模型配置
-        self.config = LlamaConfig.from_pretrained(model_path)
+        self.config = Qwen2Config.from_pretrained(model_path)
         self.config.rope_scaling = {
             "type": "linear",
             "factor": 2.0
@@ -58,9 +55,8 @@ class TableQAEvaluator:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         # 初始化生成配置
         self.generation_config = GenerationConfig(
-            num_beams=3,
+            num_beams=5,
             max_length=30000,
-            early_stopping=True,  # 改为 True，当达到停止条件时提前结束生成
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
             # 添加以下参数来控制生成质量
@@ -76,32 +72,19 @@ class TableQAEvaluator:
 
         apply_table_llama(
                 self.model,
-                starting_layer=7,
-                ending_layer=12,
+                starting_layer=10,
+                ending_layer=13,
                 entropy_threshold=0.9,
                 retracing_ratio=0.05
             )
         print(f"模型 {model_path} 已加载完成")
         
         # 初始化表格相关行提取器
-        self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
+        # self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
         
-        # 初始化表格处理器 - 修正这里，只保留一个实例化
-        # 单表处理器（如果需要的话）
-        self.single_table_processor = SingleTableProcessor(
-            self.tokenizer, 
-            self.device, 
-            self.table_token_budget
-        )
-        
-        # 多表处理器 - 传入self作为llm_model
-        self.table_processor = TableProcessor(
-            self.tokenizer, 
-            self.relevance_extractor, 
-            self.model,  # 将自身作为 llm_model 传递
-            self.device, 
-            self.table_token_budget
-        )
+        # 初始化表格处理器
+        self.table_processor = SingleTableProcessor(self.tokenizer, self.device, self.table_token_budget)
+        # self.table_processor = TableProcessor(self.tokenizer, self.relevance_extractor, self.device, self.table_token_budget)
   
 
     def _load_prompt_templates(self,prompt_type="default"):
@@ -144,13 +127,13 @@ class TableQAEvaluator:
         """
         # 初始化TaskCore
         task_core = TaskCore(db_root, task_path, result_path)
-        self.markdown=markdown
+        
         # 获取模型名称，根据提示类型添加后缀
         model_name = f"TableLlama_{prompt_type}"
         
         # 创建一个包装函数，将prompt_type传递给answer_question
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
-            return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type,markdown=markdown)
+            return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type)
         
         # 初始化评估指标和结果存储
         all_results = {}
@@ -253,42 +236,29 @@ class TableQAEvaluator:
             "overall_accuracy": overall_accuracy,
             "scale_accuracy": scale_accuracy
         }
-    def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default", markdown=True):
+
+
+    def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
         """
         回答问题 (Modified to pass question to process_table_content)
         """
-        # 使用表格处理器处理表格内容
-        table_token_ids = None
-        processed_db_str = db_str  # 默认使用原始db_str
-        
-        use_table_token = prompt_type == "retrace_table"
-        table_token_ids, processed_db_str = self.table_processor.process_table_content(
-                db_str, 
-                question, 
-                self.use_llm_for_relevance,
-                markdown
-        )
-    
-        if table_token_ids is not None:
-            table_token_ids = table_token_ids.to(self.device)
-        
         prompt_template = self._load_prompt_templates(prompt_type)
-        full_prompt = prompt_template.format(db_str=processed_db_str, question=question)
-    
+        full_prompt = prompt_template.format(db_str=db_str, question=question) # Use original db_str in prompt
+
         if choices_str and "{choices_str}" not in prompt_template:
             full_prompt += f"\n\n{choices_str}"
         elif choices_str:
             full_prompt = full_prompt.replace("{choices_str}", choices_str)
-    
+
         # Prepare input prompt tokens
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful AI assistant that analyzes tables and answers questions accurately. Always provide your answer in the format 'Answer: X' where X is one of the given choices."
+                "content": "You are a helpful AI assistant that analyzes tables and solve the problem"
             },
             {
                 "role": "user",
-                "content": full_prompt.strip()  # 使用strip()移除多余的空白字符
+                "content": full_prompt 
             }
         ]
         prompt = self.tokenizer.apply_chat_template(
@@ -297,14 +267,23 @@ class TableQAEvaluator:
             add_generation_prompt=True
         )
         inputs = self.tokenizer(
-            prompt,
+            [prompt],
             return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.model.config.max_position_embeddings - self.generation_config.max_length # Reserve space for generation
         ).to(self.device)
-    
+        max_new_tokens = 20000
+        # --- Generate Table Token IDs for Injection ---
+        table_token_ids = None
+        use_table_token = prompt_type == "retrace_table"
+        if use_table_token:
+             # 使用表格处理器处理表格内容
+             table_token_ids = self.table_processor.process_table_content(db_str, question, self.use_llm_for_relevance)
+
+             if table_token_ids is not None:
+                 table_token_ids = table_token_ids.to(self.device)
+
+
         # --- Generate Answer ---
+        # Ensure table_token is handled correctly by your modified model.generate
         outputs = self.model.generate(
             **inputs,
             generation_config=self.generation_config,
@@ -312,77 +291,24 @@ class TableQAEvaluator:
             table_token=table_token_ids if use_table_token else None,
             tokenizer=self.tokenizer if use_table_token else None
         )
-    
-        # Decode the response
-        response = self.tokenizer.decode(
-            outputs[-1],
+
+        # Decode the *generated part* only
+        # inputs.input_ids.shape[1] gives the length of the prompt
+        # output_token_ids = outputs[0][inputs.input_ids.shape[1]:]
+        generated_ids = [ output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, outputs)]
+        response = self.tokenizer.batch_decode(
+            generated_ids,
             skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )
+        )[0]
         tokens = self.tokenizer.encode(response, add_special_tokens=False)
-    
+        print(f"response 的 token 数量: {len(tokens)}")
+
         return response
-
-
-    # 在 TableQAEvaluator 类中添加 generate 方法
-
-    def generate(self, prompt):
-        """
-        为 TableProcessor 提供生成功能的方法
-        
-        参数:
-            prompt (str): 提示文本
-            
-        返回:
-            str: 生成的文本
-        """
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant that analyzes tables and provides concise summaries."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-        
-        formatted_prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        inputs = self.tokenizer(
-            formatted_prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.model.config.max_position_embeddings - 1024  # 为生成保留空间
-        ).to(self.device)
-        
-        # 生成回答
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=512,  # 摘要应该相对简短
-            temperature=0.7,
-            top_p=0.9,
-            do_sample=True
-        )
-        
-        # 解码生成的部分
-        response = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )
-        
-        return response.strip()
 
 
 def main():
     parser = argparse.ArgumentParser(description="多表格问答评估")
-    parser.add_argument("--model_path", type=str, default="chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct", 
+    parser.add_argument("--model_path", type=str, default="/hpc2hdd/home/fye374/models/Meta-Llama-3.1-8B-Instruct", 
                         help="模型路径")
     parser.add_argument("--db_root", type=str, required=True, help="数据库根目录")
     parser.add_argument("--task_path", type=str, required=True, help="任务文件路径")
@@ -491,7 +417,7 @@ def main():
         
 # Single question test example
 def test_single_question():
-    model_path = "chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct"
+    model_path = "/hpc2hdd/home/fye374/models/Meta-Llama-3.1-8B-Instruct"
     # 检测是否有多个GPU可用
     multi_gpu = torch.cuda.device_count() > 1
     evaluator = TableQAEvaluator(model_path, multi_gpu=multi_gpu)
@@ -619,7 +545,7 @@ def test_single_question():
 
     # Test three different question - asking methods
     for prompt_type in ["default", "cot", "retrace_table"]:
-        # print(f"\n===== Question - asking method: {prompt_type} =====")
+        print(f"\n===== Question - asking method: {prompt_type} =====")
         response = evaluator.answer_question(table_content, question, "", prompt_type=prompt_type)
         print("Answer:", response)
 

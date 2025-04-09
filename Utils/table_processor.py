@@ -10,235 +10,187 @@ class TableProcessor:
     用于解析、过滤和线性化表格数据
     """
     
-    def __init__(self, tokenizer, relevance_extractor, device="cuda:0", table_token_budget=2048):
-        """
-        初始化表格处理器
-        
-        参数:
-            tokenizer: 分词器
-            relevance_extractor: 表格相关行提取器
-            device: 设备名称
-            table_token_budget: 表格token预算
-        """
+    def __init__(self, tokenizer, relevance_extractor, llm_model, device="cuda:0", table_token_budget=2048):
         self.tokenizer = tokenizer
         self.relevance_extractor = relevance_extractor
+        self.llm_model = llm_model
         self.device = device
         self.table_token_budget = table_token_budget
+
+    def generate_table_summary_and_filter_columns(self, table_name, df, question, filter_columns=False):
+        """同时生成表格摘要和筛选相关列"""
+        # 构建提示
+        prompt = f"Please analyze the following table.\nTable name: {table_name}\n"
+        prompt += f"Columns: {', '.join(df.columns)}\n"
+        prompt += f"Sample data:\n{df.head(2).to_string()}\n"
+        
+        if filter_columns and len(df.columns) > 5:
+            prompt += f"\nBased on the question: '{question}'\n"
+            prompt += "Task 1: Provide a brief summary of the table's content and purpose in 1-2 sentences.\n"
+            prompt += "Task 2: List only the column names that are relevant to answering this question, separated by commas.\n"
+            prompt += "Format your response as:\nSummary: [your summary]\nRelevant columns: [comma-separated column names]"
+        else:
+            prompt += "\nTask: Provide a brief summary of the table's content and purpose in 1-2 sentences.\n"
+            prompt += "Format your response as:\nSummary: [your summary]"
+        
+        response = self.llm_model.generate(prompt)
+        
+        # 解析响应
+        summary = ""
+        relevant_columns = []
+        
+        # 提取摘要
+        summary_match = re.search(r"Summary:\s*(.*?)(?:\nRelevant columns:|$)", response, re.DOTALL)
+        if summary_match:
+            summary = summary_match.group(1).strip()
+        
+        # 如果需要筛选列，提取相关列
+        if filter_columns and len(df.columns) > 5:
+            columns_match = re.search(r"Relevant columns:\s*(.*?)$", response, re.DOTALL)
+            if columns_match:
+                column_text = columns_match.group(1).strip()
+                relevant_columns = [col.strip() for col in column_text.split(',')]
+                # 确保所有列名都在原表中存在
+                relevant_columns = [col for col in relevant_columns if col in df.columns]
+                
+                # 如果没有找到有效列或筛选后列数太少，使用基本列
+                if len(relevant_columns) < 2:
+                    # 至少保留ID列和一些基本信息列
+                    basic_columns = []
+                    for col in df.columns:
+                        if 'id' in col.lower() or 'name' in col.lower() or 'code' in col.lower():
+                            basic_columns.append(col)
+                    
+                    # 如果基本列加上有效列不足5个，添加更多列直到达到5个或用完所有列
+                    all_columns = list(set(relevant_columns + basic_columns))
+                    if len(all_columns) < 5:
+                        remaining = list(set(df.columns) - set(all_columns))
+                        all_columns.extend(remaining[:5-len(all_columns)])
+                
+                relevant_columns = all_columns if all_columns else list(df.columns)
     
-    def process_table_content(self, db_str, question, use_llm_for_relevance=False,markdown=True):
-        """
-        解析多表格Markdown/CSV，提取相关模式和行（带列过滤），
-        线性化，并在预算内标记化。
+        return summary, relevant_columns
 
-        参数:
-            db_str (str): 数据库表格字符串表示。
-            question (str): 问题文本。
-            use_llm_for_relevance (bool): 启用基于LLM的行过滤的标志。
-            markdown: markdown--True,csv--False
-
-        返回:
-            torch.Tensor or None: 处理后的表格token ID或失败时为None。
-        """
-        max_tokens = self.table_token_budget
+    def process_table_content(self, db_str, question, use_llm_for_relevance=False, markdown=True):
+        """处理表格内容，返回token和处理后的文本"""
         parsed_tables = []
         
-        # 首先按主标题（如#airline）拆分
+        # 解析主标题和子标题
         main_sections = re.split(r'(^#\s*\w+\s*?$)', db_str, flags=re.MULTILINE)
         
-        # 如果没有主标题，则直接处理整个字符串
         if len(main_sections) <= 1:
-            # 按子标题（如## Air_Carriers）拆分
-            table_sections = re.split(r'(^##\s+[\w_]+\s*?$)', db_str, flags=re.MULTILINE)
-            current_table_name = "default_table"
-            content_buffer = []
-            
-            if len(table_sections) <= 1:
-                # 如果没有子标题，则整个内容作为一个表格处理
-                content_buffer = db_str.strip().split('\n')
-                table_sections = []
-            else:
-                # 处理子标题分隔的表格
-                for section in table_sections:
-                    section = section.strip()
-                    if not section: continue
-                    if section.startswith("##"):
-                        # 处理前一个表格的内容
-                        if content_buffer:
-                            df = parse_markdown_table(content_buffer)
-                            if df is not None:
-                                parsed_tables.append({"name": current_table_name, "df": df})
-                            else:  # 尝试CSV解析
-                                self._try_parse_csv(content_buffer, current_table_name, parsed_tables)
-                            content_buffer = []
-                        # 更新当前表格名称
-                        current_table_name = section.lstrip('#').strip()
-                    else:
-                        content_buffer.extend(section.split('\n'))
+            # 处理无主标题情况
+            parsed_tables.extend(self._process_section(db_str))
         else:
-            # 处理有主标题的情况
+            # 处理有主标题情况
             current_main_title = None
             for section in main_sections:
                 section = section.strip()
-                if not section: continue
+                if not section: 
+                    continue
                 
                 if section.startswith("#") and not section.startswith("##"):
-                    # 这是一个主标题
                     current_main_title = section.lstrip('#').strip()
                 else:
-                    # 在主标题下处理子标题
-                    sub_sections = re.split(r'(^##\s+[\w_]+\s*?$)', section, flags=re.MULTILINE)
-                    current_table_name = current_main_title if current_main_title else "default_table"
-                    content_buffer = []
-                    
-                    for sub_section in sub_sections:
-                        sub_section = sub_section.strip()
-                        if not sub_section: continue
-                        
-                        if sub_section.startswith("##"):
-                            # 处理前一个表格的内容
-                            if content_buffer:
-                                df = parse_markdown_table(content_buffer)
-                                if df is not None:
-                                    # 使用主标题和子标题组合作为表格名称
-                                    table_name = f"{current_main_title}_{current_table_name}" if current_main_title else current_table_name
-                                    parsed_tables.append({"name": table_name, "df": df})
-                                else:  # 尝试CSV解析
-                                    table_name = f"{current_main_title}_{current_table_name}" if current_main_title else current_table_name
-                                    self._try_parse_csv(content_buffer, table_name, parsed_tables)
-                                content_buffer = []
-                            # 更新当前表格名称
-                            current_table_name = sub_section.lstrip('#').strip()
-                        else:
-                            content_buffer.extend(sub_section.split('\n'))
+                    tables = self._process_section(section, current_main_title)
+                    parsed_tables.extend(tables)
         
-        # 处理最后一个表格内容
-        if content_buffer:
-            # 确定最终的表格名称
-            if 'current_main_title' in locals() and current_main_title:
-                final_table_name = f"{current_main_title}_{current_table_name}"
-            else:
-                final_table_name = current_table_name
-                
-            df = parse_markdown_table(content_buffer)
-            if df is not None:
-                parsed_tables.append({"name": final_table_name, "df": df})
-            else:  # 尝试CSV解析
-                self._try_parse_csv(content_buffer, final_table_name, parsed_tables)
+        # 为每个表格生成摘要并筛选列（如果需要）
+        for table in parsed_tables:
+            summary, relevant_columns = self.generate_table_summary_and_filter_columns(
+                table['name'], 
+                table['df'], 
+                question, 
+                filter_columns=use_llm_for_relevance
+            )
+            
+            table['summary'] = summary
+            
+            # 如果需要筛选列且有返回相关列
+            if use_llm_for_relevance and relevant_columns:
+                table['filtered_columns'] = relevant_columns
+                table['df'] = table['df'][relevant_columns]
         
-        # 如果没有解析到任何内容的回退
-        if not parsed_tables:
-            print("警告: 无法从db_str解析任何结构化表格。使用原始字符串（截断）。")
-            encoded = self.tokenizer.encode(db_str, max_length=max_tokens, truncation=True)
-            return torch.tensor([encoded], device=self.device)
+        # 进行实体对齐
+        if len(parsed_tables) > 1:
+            alignment = self.align_entities(parsed_tables, question)
+            for table in parsed_tables:
+                table['alignment'] = alignment
         
-        # --- 4. 线性化与列和行过滤 ---
-        compact_table_parts = []
-        question_keywords = set(question.lower().split())
-        rows_to_keep_per_table_fallback = 5  # 减少回退行计数
+        # 构建最终的表格表示
+        processed_content = []
+        for table in parsed_tables:
+            # 添加表格摘要
+            processed_content.append(f"# {table['name']}")
+            processed_content.append(f"Summary: {table['summary']}")
+            
+            # 如果进行了列筛选，添加筛选信息
+            if 'filtered_columns' in table and use_llm_for_relevance:
+                processed_content.append(f"Selected columns: {', '.join(table['filtered_columns'])}")
+            
+            if 'alignment' in table:
+                processed_content.append(f"Entity Alignment: {table['alignment']}")
+            
+            # 添加表格内容
+            processed_content.append(table['df'].to_string())
+            processed_content.append("\n")
         
-        for table_info in parsed_tables:
-            table_name = table_info['name']
-            df = table_info['df']
+        # 生成最终文本
+        final_text = "\n".join(processed_content)
         
-            if df.empty:
+        # 转换为token
+        tokens = self.tokenizer.encode(final_text, add_special_tokens=False)
+        
+        # 确保不超过token预算
+        if len(tokens) > self.table_token_budget:
+            tokens = tokens[:self.table_token_budget]
+            # 如果截断了tokens，也应该截断文本
+            decoded_text = self.tokenizer.decode(tokens)
+        else:
+            decoded_text = final_text
+        
+        return torch.tensor(tokens).to(self.device), decoded_text
+
+    def _process_section(self, section_content, main_title=None):
+        """处理单个章节的表格"""
+        tables = []
+        sub_sections = re.split(r'(^##\s+[\w_]+\s*?$)', section_content, flags=re.MULTILINE)
+        current_table_name = main_title if main_title else "default_table"
+        content_buffer = []
+
+        for sub_section in sub_sections:
+            sub_section = sub_section.strip()
+            if not sub_section: 
                 continue
-        
-            # --- 步骤4a: 过滤列 ---
-            selected_columns = self.relevance_extractor.get_relevant_columns(df, question_keywords)
-            if not selected_columns:
-                print(f"警告: 未为表'{table_name}'识别到相关列。跳过表格。")
-                continue  # 如果没有相关列，则跳过表格
-        
-            compact_table_parts.append(f"表格: {table_name}")
-            # 使用选定的列作为模式
-            schema_str = "模式: " + " | ".join(map(str, selected_columns))
-            compact_table_parts.append(schema_str)
-        
-            # --- 步骤4b: 过滤行（使用LLM或关键词） ---
-            relevant_indices = []
-            if use_llm_for_relevance:
-                # LLM过滤
-                try:
-                    relevant_indices = self.relevance_extractor.get_relevant_rows(df, table_name, question)
-                    if relevant_indices:
-                        print(f"信息: 使用LLM在表'{table_name}'中找到了{len(relevant_indices)}个相关行。")
-                except Exception as e:
-                    print(f"警告: LLM相关性筛选失败: {e}，将回退到关键词匹配。")
-                    # 回退在下面处理
-        
-            # 关键词过滤（如果未使用LLM、LLM失败或返回空）
-            if not relevant_indices:
-                keyword_indices = []
-                for index, row in df.iterrows():
-                    try:
-                        # 仅在选定的列中搜索关键词以提高效率
-                        row_text_filtered_cols = ' '.join(map(str, row[selected_columns].fillna('').values)).lower()
-                        if any(keyword in row_text_filtered_cols for keyword in question_keywords):
-                            keyword_indices.append(index)
-                    except Exception:
-                        continue
-                relevant_indices = keyword_indices  # 使用关键词结果
-                if relevant_indices and not use_llm_for_relevance:  # 仅当关键词是主要方法时打印
-                    print(f"信息: 使用关键词匹配在表'{table_name}'（相关列）中找到了{len(relevant_indices)}个相关行。")
-        
-            selected_indices = relevant_indices
-            if not relevant_indices:
-                # 回退：如果未找到相关行，保留前N行
-                selected_indices = df.head(rows_to_keep_per_table_fallback).index.tolist()
-                if selected_indices:
-                    print(f"信息: 在表'{table_name}'中未找到相关行。使用前{len(selected_indices)}行。")
-        
-            # --- 步骤4c: 线性化选定的行和列 ---
-            rows_added = 0
-            # 限制实际线性化的行数，即使有很多相关行也避免过长
-            MAX_ROWS_TO_LINEARIZE = 30  # 示例限制
-            for index in selected_indices[:MAX_ROWS_TO_LINEARIZE]:
-                try:
-                    # 仅选择特定行的相关列
-                    row_data = df.loc[index, selected_columns]
-                    row_values_str = [str(v) if pd.notna(v) else '' for v in row_data.values]
-                    row_str = f"行 {index}: {' | '.join(row_values_str)}"
-                    compact_table_parts.append(row_str)
-                    rows_added += 1
-                except KeyError:
-                    print(f"警告: 在表'{table_name}'的行线性化过程中未找到索引{index}。")
-                except Exception as e:
-                    print(f"警告: 线性化表'{table_name}'的行{index}时出错: {e}")
-        
-            if rows_added == 0 and selected_indices:
-                print(f"警告: 无法线性化表'{table_name}'的任何选定行。")
-        
-            compact_table_parts.append("---")  # 分隔符
-        
-        # --- 5. 标记化 ---
-        compact_table_str = "\n".join(compact_table_parts).strip().rstrip('---').strip()
-        if not compact_table_str:
-            print("警告: 生成的紧凑表格字符串为空。返回None。")
-            return None
-        
-        table_token_ids = self.tokenizer(
-            compact_table_str,
-            return_tensors='pt',
-            max_length=max_tokens,
-            truncation=True,
-            add_special_tokens=False
-        ).input_ids
-        if table_token_ids.shape[1] >= max_tokens:
-            print(f"警告: 最终处理的表格内容被截断至{max_tokens}个tokens。")
-        
-        return table_token_ids.to(self.device)
-    
-    def _try_parse_csv(self, content_buffer, table_name, parsed_tables):
-        """辅助方法：尝试将内容解析为CSV格式"""
-        try:
-            delimiter = ',' if any(',' in line for line in content_buffer[:5]) else ('|' if any('|' in line for line in content_buffer[:5]) else '\t')
-            csv_like_string = "\n".join(line for line in content_buffer if line.strip())  # 跳过空行
-            df_csv = pd.read_csv(StringIO(csv_like_string), sep=delimiter, skipinitialspace=True, quotechar='"', on_bad_lines='skip')
-            if not df_csv.empty:
-                df_csv = df_csv.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-                parsed_tables.append({"name": table_name, "df": df_csv})
-                print(f"信息: 将'{table_name}'下的块解析为CSV（分隔符'{delimiter}'）。")
+
+            if sub_section.startswith("##"):
+                if content_buffer:
+                    table = self._parse_table_content(content_buffer, current_table_name)
+                    if table:
+                        tables.append(table)
+                    content_buffer = []
+                current_table_name = sub_section.lstrip('#').strip()
             else:
-                print(f"警告: 无法将表'{table_name}'下的内容解析为Markdown或CSV。")
-        except Exception as e_csv:
-            print(f"警告: 解析表'{table_name}'下的内容为Markdown或CSV失败: {e_csv}")
+                content_buffer.extend(sub_section.split('\n'))
+
+        # 处理最后一个表格
+        if content_buffer:
+            table = self._parse_table_content(content_buffer, current_table_name)
+            if table:
+                tables.append(table)
+
+        return tables
+
+    def _parse_table_content(self, content_buffer, table_name):
+        """解析表格内容"""
+        df = parse_markdown_table(content_buffer)
+        if df is not None:
+            return {"name": table_name, "df": df}
+        else:
+            # 尝试CSV解析
+            try:
+                content = '\n'.join(content_buffer)
+                df = pd.read_csv(StringIO(content))
+                return {"name": table_name, "df": df}
+            except:
+                return None
