@@ -12,10 +12,13 @@ from Utils.database import DB
 
 
 def extractAnswer(text: str) -> str:
-    patt = r"answer:\s*([A-F]+)"
-    grps = re.findall(patt, text, re.IGNORECASE)
+    patt = r"[Aa]nswer:\s*([A-D])"
+    
+    grps = re.findall(patt, text)
+    
     if grps:
         return grps[-1].upper()
+    
     return ""
 
 

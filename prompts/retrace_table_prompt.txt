@@ -1,12 +1,18 @@
-Analyze the provided table data carefully and answer the subsequent question.
+Please carefully analyze the following multiple tables and answer the question.
+
 Table data:
 {db_str}
+
 Question:
 {question}
-Instructions:
-1. Identify the key information from the tables
-2. Analyze each option briefly and clearly
-3. Provide your reasoning in a concise manner
-4. End with "Answer: [A/B/C/D]" on a new line
 
-Remember to complete your entire response without truncation.
+{choices_str}
+
+Instructions:
+1. Extract key data from all tables and identify table relationships
+2. Analyze how tables connect and which data is relevant
+3. Evaluate each option using evidence from the tables
+4. Provide brief, clear reasoning for your choice
+5. End with "Answer: [A/B/C/D]" on a new line
+
+Remember to complete your entire analysis without truncation and ensure your reasoning is supported by the data in the tables.

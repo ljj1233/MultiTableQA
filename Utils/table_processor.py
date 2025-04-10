@@ -121,28 +121,94 @@ class TableProcessor:
 
     def process_table_content(self, db_str, question, use_llm_for_relevance=False, markdown=True):
         """处理表格内容，返回token和处理后的文本"""
+        if not db_str or not isinstance(db_str, str):
+            print(f"警告: 输入的db_str为空或类型不正确: {type(db_str)}")
+            return torch.tensor([]).to(self.device), ""
+                
         parsed_tables = []
         
-        # 解析主标题和子标题
-        main_sections = re.split(r'(^#\s*\w+\s*?$)', db_str, flags=re.MULTILINE)
+        # 将文本按行分割
+        lines = db_str.split('\n')
+        main_sections = []
+        current_section = []
+        current_title = None
         
+        # 逐行处理
+        for line in lines:
+            line = line.strip()
+            if line.startswith('#') and not line.startswith('##'):
+                # 如果遇到新的主标题，保存之前的部分
+                if current_title:
+                    main_sections.append((current_title, '\n'.join(current_section)))
+                # 开始新的部分
+                current_title = line.lstrip('#').strip()
+                current_section = []
+            else:
+                current_section.append(line)
+        
+        # 处理最后一个部分
+        if current_title:
+            main_sections.append((current_title, '\n'.join(current_section)))
+        
+        # 处理每个部分
+        for title, content in main_sections:
+            if title and content:
+                print(f"检测到主标题: {title}")
+                tables = self._process_section(content, title)
+                if tables:
+                    parsed_tables.extend(tables)
+                    print(f"成功解析表格，标题: {title}")
+                else:
+                    print(f"警告: 未能解析表格内容，标题: {title}")
+    
+        # 如果没有解析到任何表格，尝试直接解析整个内容
+        if not parsed_tables:
+            print("未解析到任何表格，尝试作为单个表格处理")
+            try:
+                df = pd.read_csv(StringIO(db_str))
+                parsed_tables.append({"name": "default_table", "df": df})
+            except Exception as e:
+                print(f"直接解析失败: {str(e)}")
+                return torch.tensor([]).to(self.device), db_str
+
         if len(main_sections) <= 1:
-            # 处理无主标题情况
-            parsed_tables.extend(self._process_section(db_str))
+            # 处理无主标题情况，添加调试信息
+            print("未检测到主标题，尝试直接解析表格内容")
+            tables = self._process_section(db_str)
+            if tables:
+                parsed_tables.extend(tables)
+            else:
+                print("警告: 直接解析表格失败")
         else:
             # 处理有主标题情况
             current_main_title = None
             for section in main_sections:
                 section = section.strip()
-                if not section: 
+                if not section:
                     continue
                 
                 if section.startswith("#") and not section.startswith("##"):
                     current_main_title = section.lstrip('#').strip()
+                    print(f"检测到主标题: {current_main_title}")
                 else:
                     tables = self._process_section(section, current_main_title)
-                    parsed_tables.extend(tables)
+                    if tables:
+                        parsed_tables.extend(tables)
+                        print(f"成功解析表格，标题: {current_main_title}")
+                    else:
+                        print(f"警告: 未能解析表格内容，标题: {current_main_title}")
         
+        # 如果没有解析到任何表格，尝试直接解析整个内容
+        if not parsed_tables:
+            print("未解析到任何表格，尝试作为单个表格处理")
+            try:
+                df = pd.read_csv(StringIO(db_str))
+                parsed_tables.append({"name": "default_table", "df": df})
+            except Exception as e:
+                print(f"直接解析失败: {str(e)}")
+                # 返回空结果
+                return torch.tensor([]).to(self.device), db_str
+
         # 为每个表格生成摘要并筛选列（如果需要）
         for table in parsed_tables:
             summary, relevant_columns = self.generate_table_summary_and_filter_columns(
@@ -201,44 +267,69 @@ class TableProcessor:
 
     def _process_section(self, section_content, main_title=None):
         """处理单个章节的表格"""
+        if not section_content:
+            return []
+            
         tables = []
-        sub_sections = re.split(r'(^##\s+[\w_]+\s*?$)', section_content, flags=re.MULTILINE)
+        # 使用更精确的正则表达式来匹配子标题
+        sub_sections = re.split(r'(?m)^(##\s*[\w_]+)', section_content)
         current_table_name = main_title if main_title else "default_table"
         content_buffer = []
 
+        print(f"处理章节，主标题: {main_title}")  # 调试信息
+
         for sub_section in sub_sections:
             sub_section = sub_section.strip()
-            if not sub_section: 
+            if not sub_section:
                 continue
 
             if sub_section.startswith("##"):
+                # 处理之前的内容
                 if content_buffer:
+                    print(f"尝试解析表格内容: {current_table_name}")  # 调试信息
+                    print(f"内容缓冲区: {content_buffer[:2]}...")  # 显示部分内容
                     table = self._parse_table_content(content_buffer, current_table_name)
                     if table:
                         tables.append(table)
+                        print(f"成功解析表格: {current_table_name}")
                     content_buffer = []
                 current_table_name = sub_section.lstrip('#').strip()
             else:
-                content_buffer.extend(sub_section.split('\n'))
+                # 只保留非空且不以#开头的行
+                valid_lines = []
+                for line in sub_section.split('\n'):
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        valid_lines.append(line)
+                if valid_lines:
+                    content_buffer.extend(valid_lines)
 
         # 处理最后一个表格
         if content_buffer:
+            print(f"处理最后一个表格: {current_table_name}")  # 调试信息
             table = self._parse_table_content(content_buffer, current_table_name)
             if table:
                 tables.append(table)
+                print(f"成功解析最后一个表格: {current_table_name}")
 
         return tables
 
     def _parse_table_content(self, content_buffer, table_name):
         """解析表格内容"""
-        df = parse_markdown_table(content_buffer)
-        if df is not None:
+        try:
+            # 首先尝试作为CSV解析
+            content = '\n'.join(content_buffer)
+            df = pd.read_csv(StringIO(content), skipinitialspace=True)
+            print(f"成功通过CSV解析表格 {table_name}")  # 调试信息
             return {"name": table_name, "df": df}
-        else:
-            # 尝试CSV解析
+        except Exception as e:
+            print(f"CSV解析失败: {str(e)}")
             try:
-                content = '\n'.join(content_buffer)
-                df = pd.read_csv(StringIO(content))
-                return {"name": table_name, "df": df}
-            except:
-                return None
+                # 如果CSV解析失败，尝试Markdown解析
+                df = parse_markdown_table(content_buffer)
+                if df is not None:
+                    print(f"成功通过Markdown解析表格 {table_name}")  # 调试信息
+                    return {"name": table_name, "df": df}
+            except Exception as e:
+                print(f"Markdown解析失败: {str(e)}")
+        return None

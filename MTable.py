@@ -63,6 +63,8 @@ logger = logging.get_logger(__name__)
 logger.setLevel(logging.WARNING)
 
 
+
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -264,9 +266,82 @@ class GlmMLP(nn.Module):
         return down_proj
 
 
+class MistralMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
 
+        # --- Table Injection Parameters ---
+        self.apply_table_injection = False
+        self.table_token = None
+        self.table_embedding = None  # Shape: (SeqLen_table, Hidden)
+        self.retracing_ratio = 0.05  # Blending factor for the attention output
+        self.entropy_threshold = 1.0
+        self.starting_layer = 0
+        self.ending_layer = 32
+        self.adapt_signal = 0
 
+        self.attention_temperature = self.hidden_size**0.5
 
+    def initialize_table_embedding(self, table_embedding):
+        """Stores the processed table embedding sequence. Non-learnable."""
+        ref_param = self.gate_proj.weight
+        target_device = ref_param.device
+        target_dtype = ref_param.dtype
+
+        table_embedding = table_embedding.to(target_device, dtype=target_dtype)
+
+        if table_embedding.ndim == 3 and table_embedding.shape[0] == 1:
+            # Squeeze batch dim: Result shape (SeqLen_table, H)
+            self.table_seq_embedding = table_embedding.squeeze(0)
+
+    def forward(self, x):  # x shape: (Batch, SeqLen_x, Hidden)
+        if hasattr(self.config, 'pretraining_tp') and self.config.pretraining_tp > 1:
+            print("Warning: Tensor Parallel > 1 detected. Injection logic might need adjustment. Falling back.")
+            ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            down_proj = self.down_proj(ffn_intermediate)
+            return down_proj
+
+        # --- Injection Logic ---
+        if self.adapt_signal == 1 and hasattr(self, 'table_seq_embedding') and self.table_seq_embedding is not None:
+            try:
+                ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+                ffn_out = self.down_proj(ffn_intermediate)
+
+                query = x  # (B, S_x, H)
+                key = self.table_seq_embedding  # (S_table, H)
+                value = self.table_seq_embedding  # (S_table, H)
+
+                # Ensure key/value are on the same device as query
+                key = key.to(query.device, dtype=query.dtype)
+                value = value.to(query.device, dtype=query.dtype)
+
+                query_norm = F.normalize(query, p=2, dim=-1)  # (B, S_x, H)
+                key_norm = F.normalize(key, p=2, dim=-1)    # (S_table, H)
+                similarity_scores = torch.matmul(query_norm, key_norm.t())
+
+                attention_weights = F.softmax(similarity_scores / self.attention_temperature, dim=-1)
+
+                value_expanded = value.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, S_table, H)
+                attn_output = torch.matmul(attention_weights, value_expanded)
+
+                down_proj = (ffn_out * (1 - self.retracing_ratio) + attn_output * self.retracing_ratio)
+
+            except Exception as e:
+                print(f"Error during non-learnable cross-attention: {e}. Falling back to normal FFN.")
+                ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+                down_proj = self.down_proj(ffn_intermediate)
+        else:
+            ffn_intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            down_proj = self.down_proj(ffn_intermediate)
+
+        return down_proj
 
 
 def table_forward(
@@ -457,7 +532,7 @@ def generate(
     *,  # Force subsequent args to be keyword args
     table_token: Optional[torch.Tensor] = None,  # New argument for table content
     **kwargs,
-):
+    ):
 
     # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
     self._validate_model_class()
@@ -860,6 +935,12 @@ def apply_table_function_glm():
     transformers.models.glm.modeling_glm.GlmMLP = GlmMLP
     transformers.models.glm.modeling_glm.GlmModel.forward = table_forward
     transformers.models.glm.modeling_glm.GlmForCausalLM.generate = generate
+
+def apply_table_function_mistral():
+    transformers.models.mistral.modeling_mistral.MistralMLP = MistralMLP
+    transformers.models.mistral.modeling_mistral.MistralModel.forward = table_forward
+    transformers.models.mistral.modeling_mistral.MistralForCausalLM.generate = generate
+
 
 def apply_table_llama(
         self,

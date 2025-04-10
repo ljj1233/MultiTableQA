@@ -72,8 +72,8 @@ class TableQAEvaluator:
 
         apply_table_llama(
                 self.model,
-                starting_layer=7,
-                ending_layer=10,
+                starting_layer=10,
+                ending_layer=13,
                 entropy_threshold=0.9,
                 retracing_ratio=0.05
             )
@@ -254,7 +254,7 @@ class TableQAEvaluator:
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful AI assistant that analyzes tables "
+                "content": "You are a helpful assistant. "
             },
             {
                 "role": "user",

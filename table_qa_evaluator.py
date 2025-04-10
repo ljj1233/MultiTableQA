@@ -86,8 +86,6 @@ class TableQAEvaluator:
         # 初始化表格相关行提取器
         self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
         
-        # 初始化表格处理器 - 修正这里，只保留一个实例化
-        # 单表处理器（如果需要的话）
         self.single_table_processor = SingleTableProcessor(
             self.tokenizer, 
             self.device, 

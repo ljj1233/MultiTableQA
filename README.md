@@ -110,11 +110,11 @@ python ./table_qa_evaluator.py \
 
 ```bash 
 # 表格增强提示模式评估（使用Markdown格式）
-python ./table_qa_evaluator.py \
-  --model_path /hpc2hdd/home/fye374/models/Meta-Llama-3.1-8B-Instruct \
+python ./table_qa_evaluator_glm.py \
+  --model_path GLM/ \
   --db_root dataset/task/scaledDB \
   --task_path dataset/task/tableQA/dataset.sqlite \
-  --result_path dataset/results/tableQA/llama3_retrace_7db.sqlite \
+  --result_path dataset/results/tableQA/glm_retrace_7db.sqlite \
   --dataset TableQA \
   --scale 8k \
   --prompt_type retrace_table \
