@@ -322,35 +322,35 @@ def test_single_question():
 
     # 表格内容
     table_content = """
-    # 员工信息表
+    # Employee Information Table
     
-    ## 员工
+    ## Employees
     
-    员工ID,姓名,部门ID,职位,薪资,入职日期
-    1,张三,101,工程师,15000,2020-01-15
-    2,李四,102,设计师,12000,2019-05-20
-    3,王五,101,高级工程师,20000,2018-03-10
-    4,赵六,103,产品经理,18000,2021-02-01
-    5,钱七,102,UI设计师,13000,2020-07-15
+    EmployeeID,Name,DepartmentID,Position,Salary,JoinDate
+    1,Zhang San,101,Engineer,15000,2020-01-15
+    2,Li Si,102,Designer,12000,2019-05-20
+    3,Wang Wu,101,Senior Engineer,20000,2018-03-10
+    4,Zhao Liu,103,Product Manager,18000,2021-02-01
+    5,Qian Qi,102,UI Designer,13000,2020-07-15
     
-    ## 部门
+    ## Departments
     
-    部门ID,部门名称,部门主管,位置
-    101,研发部,张明,A栋3层
-    102,设计部,刘芳,A栋2层
-    103,产品部,陈强,B栋1层
+    DepartmentID,DepartmentName,Manager,Location
+    101,R&D Department,Zhang Ming,Building A 3F
+    102,Design Department,Liu Fang,Building A 2F
+    103,Product Department,Chen Qiang,Building B 1F
     
-    ## 项目
+    ## Projects
     
-    项目ID,项目名称,负责部门,预算,开始日期,结束日期
-    P001,移动应用开发,101,500000,2022-01-01,2022-06-30
-    P002,网站重设计,102,300000,2022-02-15,2022-05-15
-    P003,新产品规划,103,450000,2022-03-01,2022-08-31
+    ProjectID,ProjectName,ResponsibleDept,Budget,StartDate,EndDate
+    P001,Mobile App Development,101,500000,2022-01-01,2022-06-30
+    P002,Website Redesign,102,300000,2022-02-15,2022-05-15
+    P003,New Product Planning,103,450000,2022-03-01,2022-08-31
     """
 
-    # 示例问题
-    question = "研发部有多少名员工？"
-    choices_str = "A. 1名\nB. 2名\nC. 3名\nD. 4名"
+    # Example question
+    question = "How many employees are in the R&D Department?"
+    choices_str = "A. 1 person\nB. 2 persons\nC. 3 persons\nD. 4 persons"
 
     # 测试不同问题提问方式
     for prompt_type in ["default", "cot", "retrace_table"]:
