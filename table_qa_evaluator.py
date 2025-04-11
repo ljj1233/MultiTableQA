@@ -143,7 +143,6 @@ class TableQAEvaluator:
         # 初始化TaskCore
         task_core = TaskCore(db_root, task_path, result_path)
         self.markdown=markdown
-        # 获取模型名称，根据提示类型添加后缀
         model_name = f"TableLlama_{prompt_type}"
         
         # 创建一个包装函数，将prompt_type传递给answer_question
@@ -251,6 +250,9 @@ class TableQAEvaluator:
             "overall_accuracy": overall_accuracy,
             "scale_accuracy": scale_accuracy
         }
+   
+   
+   
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default", markdown=True):
         """
         回答问题 (Modified to pass question to process_table_content)
@@ -362,7 +364,7 @@ class TableQAEvaluator:
         # 生成回答
         outputs = self.model.generate(
             **inputs,
-            max_new_tokens=512,  # 摘要应该相对简短
+            max_new_tokens=512,  
             temperature=0.7,
             top_p=0.9,
             do_sample=True

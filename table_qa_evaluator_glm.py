@@ -78,16 +78,30 @@ class TableQAEvaluator:
         
         return prompt_template
 
+
     def run_evaluation(self, db_root, task_path, result_path, 
                       dataset_name, scale, markdown=True, 
                       db_limit=5, sample_limit=5, question_limit=5, 
                       time_sleep=0, prompt_type="default"):
-        """运行评估"""
+        """
+        运行评估
+        
+        参数:
+        - db_root: 数据库根目录
+        - task_path: 任务文件路径
+        - result_path: 结果保存路径
+        - dataset_name: 数据集名称
+        - scale: 数据规模
+        - markdown: 是否使用markdown格式
+        - db_limit, sample_limit, question_limit: 评估范围限制
+        - time_sleep: 每次评估间隔时间
+        - prompt_type: 提示类型，可选值为 "default", "cot", "retrace_table"
+        """
         # 初始化TaskCore
         task_core = TaskCore(db_root, task_path, result_path)
         
         # 获取模型名称，根据提示类型添加后缀
-        model_name = f"TableGLM_{prompt_type}"
+        model_name = f"TableLlama_{prompt_type}"
         
         # 创建一个包装函数，将prompt_type传递给answer_question
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
@@ -297,22 +311,89 @@ def main():
         multi_gpu=args.multi_gpu,
         use_llm_for_relevance=args.use_llm_relevance
     )
-    
-    # 运行评估
-    evaluator.run_evaluation(
-        db_root=args.db_root,
-        task_path=args.task_path,
-        result_path=args.result_path,
-        dataset_name=args.dataset,
-        scale=args.scale,
-        markdown=args.markdown,   
-        db_limit=args.db_limit,
-        sample_limit=args.sample_limit,
-        question_limit=args.question_limit,
-        time_sleep=args.time_sleep,
-        prompt_type=args.prompt_type
-    )
 
+    # 初始化评估器，传入设备和多GPU参数
+    evaluator = TableQAEvaluator(
+        args.model_path, 
+        device=args.device, 
+        multi_gpu=args.multi_gpu,
+        use_llm_for_relevance=args.use_llm_relevance
+    )
+    
+    # 如果不使用表格增强功能，则禁用它
+    if args.prompt_type != "retrace_table":
+        for layer in evaluator.model.model.layers:
+            if hasattr(layer.mlp, 'apply_table_injection'):
+                layer.mlp.apply_table_injection = False
+    
+    # 存储所有scale的评估结果
+    all_results = {'markdown': {}, 'csv': {}}
+    
+    # 对每个scale进行评估
+    for scale in args.scale:
+        # 根据scale设置time_sleep
+        time_sleep = 0
+        if scale == "16k":
+            time_sleep = 30
+        elif scale == "32k":
+            time_sleep = 60
+        
+        # 分别评估 markdown 和非 markdown 格式
+        for format_type in ['markdown', 'csv']:
+            is_markdown = format_type == 'markdown'
+            print(f"\n开始评估 scale={scale}, format={format_type}")
+            
+            # 修改结果文件路径以区分格式
+            current_result_path = args.result_path.replace(
+                '.sqlite', 
+                f'_{scale}_{format_type}.sqlite'
+            )
+            
+            # 运行评估并获取指标
+            metrics = evaluator.run_evaluation(
+                db_root=args.db_root,
+                task_path=args.task_path,
+                result_path=current_result_path,
+                dataset_name=args.dataset,
+                scale=scale,
+                markdown=is_markdown,   
+                db_limit=args.db_limit,
+                sample_limit=args.sample_limit,
+                question_limit=args.question_limit,
+                time_sleep=time_sleep or args.time_sleep,
+                prompt_type=args.prompt_type
+            )
+            
+            all_results[format_type][scale] = metrics
+
+    # 分别输出 markdown 和非 markdown 的评估结果
+    for format_type in ['markdown', 'csv']:
+        print(f"\n=== {format_type} 格式评估结果总结 ===")
+        total_correct = 0
+        total_questions = 0
+        
+        for scale, metrics in all_results[format_type].items():
+            print(f"\nScale: {scale}")
+            print(f"总问题数: {metrics['total_count']}")
+            print(f"正确回答数: {metrics['correct_count']}")
+            # 计算准确率
+            accuracy = (metrics['correct_count'] / metrics['total_count'] * 100) if metrics['total_count'] > 0 else 0
+            print(f"准确率: {accuracy:.2f}%")
+            
+            # 累计总数
+            total_correct += metrics['correct_count']
+            total_questions += metrics['total_count']
+        
+        # 计算整体准确率
+        overall_accuracy = (total_correct / total_questions * 100) if total_questions > 0 else 0
+        print(f"\n=== {format_type} 格式整体统计 ===")
+        print(f"总问题数: {total_questions}")
+        print(f"总正确数: {total_correct}")
+        print(f"整体准确率: {overall_accuracy:.2f}%")
+        print(f"{format_type} 格式各规模准确率:")
+        for scale, metrics in all_results[format_type].items():
+            for sub_scale, acc in metrics['scale_accuracy'].items():
+                print(f"  {sub_scale} 规模: {acc:.2f}%")
 # 单个问题测试示例
 def test_single_question():
     model_path = "GLM/"

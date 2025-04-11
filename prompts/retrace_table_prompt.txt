@@ -6,7 +6,6 @@ Table data:
 Question:
 {question}
 
-{choices_str}
 
 Instructions:
 1. Extract key data from all tables and identify table relationships

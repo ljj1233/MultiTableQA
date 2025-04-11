@@ -7,7 +7,8 @@ from typing import List, Dict, Any, Optional, Union, Tuple
 
 # VLLM相关导入
 from vllm import LLM, SamplingParams
-
+import sys
+sys.path.append("../")
 # 原始TableQAEvaluator相关导入
 from Utils.dataLoader import TaskCore, DB,extractAnswer
 from Utils.table_relevance import TableRelevanceExtractor
