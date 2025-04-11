@@ -12,12 +12,21 @@ from Utils.database import DB
 
 
 def extractAnswer(text: str) -> str:
-    patt = r"[Aa]nswer:\s*([A-D])"
+    # 处理可能的换行情况
+    text = text.replace('\n', ' ')
     
-    grps = re.findall(patt, text)
+    # 匹配模式：既可以匹配 "Answer: A" 也可以匹配 "Answer 换行 A"
+    patterns = [
+        r"[Aa]nswer:\s*([A-D])",  # 匹配 "Answer: A" 格式
+        r"[Aa]nswer\s*[\n\r]*\s*([A-D])",  # 匹配 "Answer 换行 A" 格式
+        r"[Aa]nswer[:\s]*[\n\r]*\s*([A-D])",  # 匹配两种格式的组合
+        r"\*\*[Aa]nswer\*\*\s*[\n\r]*\s*([A-D])",  # 匹配 "**Answer** B" 格式
+    ]
     
-    if grps:
-        return grps[-1].upper()
+    for pattern in patterns:
+        grps = re.findall(pattern, text)
+        if grps:
+            return grps[-1].upper()
     
     return ""
 
@@ -159,7 +168,6 @@ class TaskCore:
         """
         func need to be a call function have 3 arguments -- dbStr, question, choicesStr
         """
-        print(len(dbLimit), len(sampleLimit), len(questionLimit))
         for dbIdx in tqdm(range(dbLimit)):
             for sampleIdx in range(sampleLimit):
                 for questionIdx in range(questionLimit):

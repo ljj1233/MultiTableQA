@@ -921,7 +921,7 @@ def generate(
 
     return result
 
-def apply_table_function():
+def apply_table_function_llama():
     transformers.models.llama.modeling_llama.LlamaMLP = LlamaMLP
     transformers.models.llama.modeling_llama.LlamaModel.forward = table_forward
     transformers.models.llama.modeling_llama.LlamaForCausalLM.generate = generate

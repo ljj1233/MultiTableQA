@@ -37,38 +37,36 @@
 
 ## 使用方法
 
-### 1. 评估开源模型
+### 1. 评估不同模型
 
-使用`open_model_evaluator.py`评估本地部署的开源模型：
-
+#### GLM模型评估
 ```bash
-# 默认提示模式评估
-python ./open_model_evaluator.py \
-  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
-  --dataset qa \
-  --scale 16k \
-  --prompt_type default
-```
+# GLM默认模式
+python table_qa_evaluator_glm.py \
+  --model_path GLM/ \
+  --db_root dataset/task/scaledDB \
+  --task_path dataset/task/tableQA/dataset.sqlite \
+  --result_path dataset/results/tableQA/glm_default.sqlite \
+  --dataset TableQA \
+  --scale 8k \
+  --prompt_type default \
+  --db_limit 5 \
+  --sample_limit 1 \
+  --question_limit 5
 
-```bash
-# 思维链(CoT)提示模式评估
-python ./open_model_evaluator.py \
-  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
-  --dataset qa \
-  --scale 16k \
-  --prompt_type cot \
-  --result_path ./results/qa_cot_result.json
-```
-
-```bash
-# 表格增强提示模式评估
-python ./open_model_evaluator.py \
-  --model_path chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct \
-  --dataset qa \
-  --scale 16k \
+# GLM表格增强模式
+python table_qa_evaluator_glm.py \
+  --model_path GLM/ \
+  --db_root dataset/task/scaledDB \
+  --task_path dataset/task/tableQA/dataset.sqlite \
+  --result_path dataset/results/tableQA/glm_retrace.sqlite \
+  --dataset TableQA \
+  --scale 8k \
   --prompt_type retrace_table \
   --markdown \
-  --log_root .\logs\qa_retrace
+  --db_limit 5 \
+  --sample_limit 1 \
+  --question_limit 5
 ```
 
 ### 2. 使用表格问答评估器
@@ -85,9 +83,10 @@ python ./table_qa_evaluator.py \
   --result_path dataset/results/tableQA/llama3_default.sqlite \
   --dataset TableQA \
   --scale 8k \
-  --db_limit 5 \
-  --sample_limit 1 \
-  --question_limit 5 \
+  --db_limit 10 \
+  --sample_limit 2 \
+  --question_limit 1 \
+  --time_sleep 10 \
    --multi_gpu
 ```
 
@@ -101,10 +100,10 @@ python ./table_qa_evaluator.py \
   --dataset TableQA \
   --scale 16k \
   --prompt_type cot \
-  --db_limit 5 \
-  --sample_limit 1 \
-  --question_limit 14 \
-  --time_sleep 30 \
+  --db_limit 10 \
+  --sample_limit 2 \
+  --question_limit 1 \
+  --time_sleep 10 \
    --multi_gpu
 ```
 
@@ -119,9 +118,9 @@ python ./table_qa_evaluator_glm.py \
   --scale 8k \
   --prompt_type retrace_table \
   --markdown \
-  --db_limit 7 \
-  --sample_limit 1 \
-  --question_limit 5 \
+  --db_limit 10 \
+  --sample_limit 2 \
+  --question_limit 1 \
   --time_sleep 10 \
    --multi_gpu
 ```

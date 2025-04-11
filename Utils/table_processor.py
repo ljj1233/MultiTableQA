@@ -54,6 +54,7 @@ class TableProcessor:
                 relevant_columns = [col for col in relevant_columns if col in df.columns]
                 
                 # 如果没有找到有效列或筛选后列数太少，使用基本列
+                all_columns = relevant_columns.copy()  # 初始化all_columns
                 if len(relevant_columns) < 2:
                     # 至少保留ID列和一些基本信息列
                     basic_columns = []
@@ -333,3 +334,98 @@ class TableProcessor:
             except Exception as e:
                 print(f"Markdown解析失败: {str(e)}")
         return None
+
+
+if __name__ == "__main__":
+    # 导入必要的库
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from .table_relevance import TableRelevanceExtractor
+    
+    # 测试数据
+    test_table_content = """
+    # Employee Data
+
+    ## Department
+    Department_ID,Department_Name,Location
+    1,HR,New York
+    2,IT,San Francisco
+    3,Finance,Chicago
+    4,Marketing,Boston
+
+    ## Employee
+    Employee_ID,Name,Department_ID,Salary
+    101,John Smith,1,50000
+    102,Jane Doe,2,60000
+    103,Bob Johnson,1,55000
+    104,Alice Brown,3,65000
+    """
+
+    test_question = "How many employees work in the HR department?"
+
+    try:
+        # 初始化组件
+        model_path = "/hpc2hdd/home/fye374/models/Meta-Llama-3.1-8B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16
+        ).to("cuda:0" if torch.cuda.is_available() else "cpu")
+        
+        # 创建模型适配器
+        model_adapter = ModelAdapter(model, tokenizer)
+        
+        relevance_extractor = TableRelevanceExtractor(model, tokenizer)
+        
+        # 创建TableProcessor实例
+        processor = TableProcessor(
+            tokenizer=tokenizer,
+            relevance_extractor=relevance_extractor,
+            llm_model=model_adapter,
+            device="cuda:0" if torch.cuda.is_available() else "cpu",
+            table_token_budget=2048
+        )
+        
+        # 测试表格处理
+        print("=== 测试表格处理 ===")
+        tokens, processed_text = processor.process_table_content(
+            test_table_content,
+            test_question,
+            use_llm_for_relevance=True,
+            markdown=True
+        )
+        
+        print("\n处理后的文本:")
+        print(processed_text)
+        
+        print("\nToken数量:", len(tokens))
+        
+        # 测试表格摘要和列筛选
+        print("\n=== 测试表格摘要和列筛选 ===")
+        df = pd.read_csv(StringIO("""
+            Employee_ID,Name,Department_ID,Salary,Email,Phone,Address
+            101,John Smith,1,50000,john@company.com,123-456-7890,123 Main St
+            102,Jane Doe,2,60000,jane@company.com,123-456-7891,456 Oak Ave
+        """))
+        
+        summary, relevant_columns = processor.generate_table_summary_and_filter_columns(
+            "Employee",
+            df,
+            test_question,
+            filter_columns=True
+        )
+        
+        print("\n生成的摘要:", summary)
+        print("相关列:", relevant_columns)
+        
+        # 测试实体对齐
+        print("\n=== 测试实体对齐 ===")
+        parsed_tables = [
+            {"name": "Department", "df": pd.read_csv(StringIO("Department_ID,Department_Name\n1,HR\n2,IT"))},
+            {"name": "Employee", "df": pd.read_csv(StringIO("Employee_ID,Name,Department_ID\n101,John,1\n102,Jane,2"))}
+        ]
+        
+        alignment = processor.align_entities(parsed_tables, test_question)
+        print("\n实体对齐结果:", alignment)
+
+    except Exception as e:
+        print(f"测试过程中出现错误: {str(e)}")

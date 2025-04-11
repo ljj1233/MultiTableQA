@@ -20,7 +20,7 @@ class TableQAEvaluator:
         self.device = device
         self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 8000   
+        self.table_token_budget = 20000   
         
         # 应用表格增强功能
         apply_table_function_mistral()
@@ -31,7 +31,15 @@ class TableQAEvaluator:
             model_path,
             trust_remote_code=True
         )
+        # 设置填充标记和最大长度
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.model.resize_token_embeddings(len(self.tokenizer))
         
+        # 设置模型的最大长度
+        self.max_length = min(self.table_token_budget, 18000)  # 使用较小的值
+        self.tokenizer.model_max_length = self.max_length
+
         # 加载模型
         print(f"正在加载Mistral模型: {model_path}")
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -213,6 +221,7 @@ class TableQAEvaluator:
             return_tensors="pt",
             padding=True,
             truncation=True,
+            max_length=self.max_length,  # 添加这行
             return_attention_mask=True
         ).to(self.device)
         
@@ -294,7 +303,7 @@ def main():
 
 # 单个问题测试示例
 def test_single_question():
-    model_path = "mistralai/Mistral-7B-Instruct-v0.3"  # 使用官方模型路径
+    model_path = "/hpc2hdd/home/fye374/models/Mistral-7B-Instruct-v0.3"  # 使用官方模型路径
     evaluator = TableQAEvaluator(model_path)
     
     # 表格内容

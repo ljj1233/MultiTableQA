@@ -4,12 +4,14 @@ import argparse
 import re
 import sqlite3  
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig, GenerationConfig
-from MTable import apply_table_llama, apply_table_function_llama,apply_table_function_qwen
+# from MTable import apply_table_llama, apply_table_function_llama,apply_table_qwen
 from Utils.dataLoader import TaskCore
 from Utils.table_relevance import TableRelevanceExtractor
 from Utils.table_parser import parse_markdown_table  
 from Utils.table_processor import TableProcessor  
 from Utils.table_processor_single import SingleTableProcessor  
+import openai
+from openai import OpenAI
 
 from symbolic import dataDict
 import pandas as pd
@@ -19,88 +21,18 @@ from tqdm import tqdm
 class TableQAEvaluator:
     # 在 TableQAEvaluator 类的 __init__ 方法中修改
     
-    def __init__(self, model_path, device="cuda:0", multi_gpu=False, use_llm_for_relevance=False):
-        # 初始化 TableLlama 模型
+    def __init__(self, api_key, base_url, device="cuda:0", use_llm_for_relevance=False):
+        # 初始化 OpenAI 客户端
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url
+        )
+        
         self.device = device
-        self.multi_gpu = multi_gpu
         self.use_llm_for_relevance = use_llm_for_relevance
-        self.table_token_budget = 5000   
-        self.markdown=True
+        self.table_token_budget = 5000
+        self.markdown = True
 
-        apply_table_function_llama()
-
-        # 加载模型配置
-        self.config = LlamaConfig.from_pretrained(model_path)
-        self.config.rope_scaling = {
-            "type": "linear",
-            "factor": 2.0
-        }
-        
-        # 加载模型和分词器
-        if multi_gpu and torch.cuda.device_count() > 1:
-            print(f"使用 {torch.cuda.device_count()} 个 GPU 进行并行计算")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                config=self.config,
-                torch_dtype=torch.float16,
-                device_map="auto"  # 自动分配到可用的GPU上
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                config=self.config,
-                torch_dtype=torch.float16
-            ).to(device)
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        # self.tokenizer.pad_token = self.tokenizer.eos_token   
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        # 初始化生成配置
-        self.generation_config = GenerationConfig(
-            num_beams=3,
-            max_length=30000,
-            early_stopping=True,  # 改为 True，当达到停止条件时提前结束生成
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-            # 添加以下参数来控制生成质量
-            repetition_penalty=1.2,  # 增加重复惩罚，范围通常在1.0-1.5
-            no_repeat_ngram_size=3,  # 禁止重复的n-gram大小
-            length_penalty=1.0,  # 长度惩罚，小于1会倾向生成更短的回答
-            temperature=0.1,  # 控制生成的随机性，越小越保守
-            top_p=0.5,  # 控制采样范围，越小生成越保守
-            do_sample=True,
-            )
-        # print(f'self.generation_config.max_length: {self.generation_config.max_length}')
-        # print(f'self.model.config.max_position_embeddings: {self.model.config.max_position_embeddings}')
-
-        apply_table_llama(
-                self.model,
-                starting_layer=7,
-                ending_layer=12,
-                entropy_threshold=0.9,
-                retracing_ratio=0.05
-            )
-        print(f"模型 {model_path} 已加载完成")
-        
-        # 初始化表格相关行提取器
-        self.relevance_extractor = TableRelevanceExtractor(self.model, self.tokenizer, self.device)
-        
-        self.single_table_processor = SingleTableProcessor(
-            self.tokenizer, 
-            self.device, 
-            self.table_token_budget
-        )
-        
-        # 多表处理器 - 传入self作为llm_model
-        self.table_processor = TableProcessor(
-            self.tokenizer, 
-            self.relevance_extractor, 
-            self.model,  # 将自身作为 llm_model 传递
-            self.device, 
-            self.table_token_budget
-        )
-  
 
     def _load_prompt_templates(self,prompt_type="default"):
         """
@@ -252,77 +184,38 @@ class TableQAEvaluator:
             "scale_accuracy": scale_accuracy
         }
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default", markdown=True):
-        """
-        回答问题 (Modified to pass question to process_table_content)
-        """
-        # 使用表格处理器处理表格内容
-        table_token_ids = None
-        processed_db_str = db_str  # 默认使用原始db_str
-        
-        use_table_token = prompt_type == "retrace_table"
-        table_token_ids, processed_db_str = self.table_processor.process_table_content(
-                db_str, 
-                question, 
-                self.use_llm_for_relevance,
-                markdown
-        )
-    
-        if table_token_ids is not None:
-            table_token_ids = table_token_ids.to(self.device)
-        
+        """使用 GPT API 回答问题"""
         prompt_template = self._load_prompt_templates(prompt_type)
-        full_prompt = prompt_template.format(db_str=processed_db_str, question=question)
-    
+        full_prompt = prompt_template.format(db_str=db_str, question=question)
+
         if choices_str and "{choices_str}" not in prompt_template:
             full_prompt += f"\n\n{choices_str}"
         elif choices_str:
             full_prompt = full_prompt.replace("{choices_str}", choices_str)
-    
-        # Prepare input prompt tokens
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant that analyzes tables "
-            },
-            {
-                "role": "user",
-                "content": full_prompt.strip()  # 使用strip()移除多余的空白字符
-            }
-        ]
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.model.config.max_position_embeddings - self.generation_config.max_length # Reserve space for generation
-        ).to(self.device)
-    
-        # --- Generate Answer ---
-        outputs = self.model.generate(
-            **inputs,
-            generation_config=self.generation_config,
-            max_new_tokens=20000,
-            table_token=table_token_ids if use_table_token else None,
-            tokenizer=self.tokenizer if use_table_token else None
-        )
-    
-        # Decode the response
-        response = self.tokenizer.decode(
-            outputs[-1],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )
-        tokens = self.tokenizer.encode(response, add_special_tokens=False)
-    
-        return response
 
+        try:
+            # 调用 GPT API
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",  # 或者使用其他可用的模型
+                messages=[
+                    {"role": "system", "content": "You are a helpful AI assistant that analyzes tables"},
+                    {"role": "user", "content": full_prompt.strip()}
+                ],
+                temperature=0.1,
+                max_tokens=1000,
+                top_p=0.5,
+                frequency_penalty=0,
+                presence_penalty=0
+            )
+            
+            # 获取回答
+            answer = response.choices[0].message.content.strip()
+            return answer
 
-    # 在 TableQAEvaluator 类中添加 generate 方法
+        except Exception as e:
+            print(f"API 调用出错: {str(e)}")
+            return f"Error: Unable to get response from API. {str(e)}"
+
 
     def generate(self, prompt):
         """
@@ -380,6 +273,12 @@ class TableQAEvaluator:
 
 def main():
     parser = argparse.ArgumentParser(description="多表格问答评估")
+    parser.add_argument("--api_key", type=str, 
+                       default="sk-DvtEkoEf9fxfm0MYB2xxSu4YjxLNsB5WcnFCQqCI7ZEJrv4p", 
+                       help="OpenAI API Key")
+    parser.add_argument("--base_url", type=str,
+                       default="https://api.chatanywhere.tech",
+                       help="API Base URL")
     parser.add_argument("--model_path", type=str, default="chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct", 
                         help="模型路径")
     parser.add_argument("--db_root", type=str, required=True, help="数据库根目录")
@@ -489,11 +388,10 @@ def main():
         
 # Single question test example
 def test_single_question():
-    model_path = "chanage_model/LLM-Research/Meta-Llama-3.1-8B-Instruct"
-    # 检测是否有多个GPU可用
-    multi_gpu = torch.cuda.device_count() > 1
-    evaluator = TableQAEvaluator(model_path, multi_gpu=multi_gpu)
-
+    api_key = "sk-DvtEkoEf9fxfm0MYB2xxSu4YjxLNsB5WcnFCQqCI7ZEJrv4p"
+    base_url = "https://api.chatanywhere.tech"
+    
+    evaluator = TableQAEvaluator(api_key=api_key, base_url=base_url)
     # Table content for multi-table association
     table_content = """
     #airline

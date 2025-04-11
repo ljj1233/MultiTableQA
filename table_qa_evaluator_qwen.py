@@ -4,7 +4,7 @@ import argparse
 import re
 import sqlite3  
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig, GenerationConfig,Qwen2Config
-from MTable import apply_table_llama, apply_table_function,apply_table_function_qwen
+from MTable import apply_table_llama, apply_table_function_llama,apply_table_function_qwen
 from Utils.dataLoader import TaskCore
 from Utils.table_relevance import TableRelevanceExtractor
 from Utils.table_parser import parse_markdown_table  
