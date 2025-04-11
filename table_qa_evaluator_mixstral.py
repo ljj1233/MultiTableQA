@@ -31,11 +31,7 @@ class TableQAEvaluator:
             model_path,
             trust_remote_code=True
         )
-        # 设置填充标记和最大长度
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-            self.model.resize_token_embeddings(len(self.tokenizer))
-        
+
         # 设置模型的最大长度
         self.max_length = min(self.table_token_budget, 18000)  # 使用较小的值
         self.tokenizer.model_max_length = self.max_length
@@ -48,7 +44,10 @@ class TableQAEvaluator:
             device_map="auto",
             trust_remote_code=True
         ).eval()
-        
+        # 设置填充标记和最大长度
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
         # 初始化表格处理器
         self.table_processor = SingleTableProcessor(self.tokenizer, self.device, self.table_token_budget)
         
@@ -75,7 +74,6 @@ class TableQAEvaluator:
         
         return prompt_template
 
-
     def run_evaluation(self, db_root, task_path, result_path, 
                       dataset_name, scale, markdown=True, 
                       db_limit=5, sample_limit=5, question_limit=5, 
@@ -97,12 +95,11 @@ class TableQAEvaluator:
         # 初始化TaskCore
         task_core = TaskCore(db_root, task_path, result_path)
         self.markdown=markdown
-        # 获取模型名称，根据提示类型添加后缀
         model_name = f"TableLlama_{prompt_type}"
         
         # 创建一个包装函数，将prompt_type传递给answer_question
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
-            return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type,markdown=markdown)
+            return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type)
         
         # 初始化评估指标和结果存储
         all_results = {}
@@ -206,7 +203,7 @@ class TableQAEvaluator:
             "scale_accuracy": scale_accuracy
         }
    
-    
+   
     def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default"):
         """回答问题"""
         prompt_template = self._load_prompt_templates(prompt_type)
@@ -250,10 +247,12 @@ class TableQAEvaluator:
 
         # 生成配置
         gen_kwargs = {
-            "max_new_tokens": 3000,
+            "max_new_tokens": 1500,
             "do_sample": True,
             "temperature": 0.1,
             "top_p": 0.5,
+            "eos_token_id":self.tokenizer.eos_token_id,
+            "pad_token_id":self.tokenizer.pad_token_id,
             "repetition_penalty": 1.2,
             "table_token": table_token_ids if use_table_token else None,
             "tokenizer": self.tokenizer if use_table_token else None
@@ -375,6 +374,7 @@ def main():
         for scale, metrics in all_results[format_type].items():
             for sub_scale, acc in metrics['scale_accuracy'].items():
                 print(f"  {sub_scale} 规模: {acc:.2f}%")
+        
 
 # 单个问题测试示例
 def test_single_question():

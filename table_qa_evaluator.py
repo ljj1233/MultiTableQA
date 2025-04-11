@@ -147,7 +147,7 @@ class TableQAEvaluator:
         
         # 创建一个包装函数，将prompt_type传递给answer_question
         def wrapped_answer_func(db_str, question, choices_str, meta_info=None):
-            return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type,markdown=markdown)
+            return self.answer_question(db_str, question, choices_str, meta_info, prompt_type=prompt_type)
         
         # 初始化评估指标和结果存储
         all_results = {}
@@ -253,7 +253,7 @@ class TableQAEvaluator:
    
    
    
-    def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default", markdown=True):
+    def answer_question(self, db_str, question, choices_str, meta_info=None, prompt_type="default" ):
         """
         回答问题 (Modified to pass question to process_table_content)
         """
@@ -266,7 +266,7 @@ class TableQAEvaluator:
                 db_str, 
                 question, 
                 self.use_llm_for_relevance,
-                markdown
+                self.markdown
         )
     
         if table_token_ids is not None:
